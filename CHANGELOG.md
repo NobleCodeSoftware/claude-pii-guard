@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-10-23
+
+### Changed
+
+- Documentation only; the hook's behaviour is unchanged.
+- `PRIVACY.md`: which local files the hook reads, and exactly what the masked reports keep.
+- README: "What is scanned" is a section heading, so the cross-references to it work; the list of
+  git variables that point to another repository includes `GIT_OBJECT_DIRECTORY` and
+  `GIT_COMMON_DIR`; the exceptions are listed in "Configuration"; the masking limitation describes
+  each detector; the Compatibility check date is 2026-10-23.
+
 ## [0.1.2] - 2026-10-23
 
 Preparation for the Claude plugin directory. The hook's behaviour is unchanged.

@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 # Shared deadline for one hook run, in seconds. Keep it well below the "timeout" in hooks/hooks.json
 # (15 s), which also has to cover starting Python.

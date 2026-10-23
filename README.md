@@ -9,7 +9,7 @@ The hook checks what Claude is about to write (`Write`, `Edit`, `MultiEdit`, `No
 commit (`git commit` from `Bash` or `PowerShell`). If it finds personal data, it blocks the call (or
 warns, or asks you, as you prefer) and tells Claude where the value is, masked.
 
-> Status: early release (v0.1.2). A single Python file using only the standard library, plus tests.
+> Status: early release (v0.1.3). A single Python file using only the standard library, plus tests.
 > Read "Limitations" before you rely on it.
 
 ## The problem
@@ -72,7 +72,7 @@ Digit detectors do not match inside longer numbers, hashes or identifiers, so ve
 hashes, UUIDs, dates, timestamps and order numbers are not reported. The test suite has a list of
 these false-positive cases.
 
-What is scanned:
+## What is scanned
 
 - `Write`: the whole new content. `NotebookEdit`: the new cell source.
 - `Edit` and `MultiEdit`: the new text only. A value that was already in the replaced text is not
@@ -126,8 +126,9 @@ In these cases the commit is scanned as well as possible and you are asked too:
 - the command defines a git alias (`-c alias.<name>=...`);
 - a `cd`, `pushd` or `-C` directory cannot be resolved (it does not exist yet, or uses a variable,
   a glob, `~user` or `cd -`);
-- the command points git at another repository, work tree or index (the `GIT_DIR`, `GIT_WORK_TREE`
-  or `GIT_INDEX_FILE` variables, `--git-dir`, `--work-tree`).
+- the command points git at another repository, work tree or index (the `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` or `GIT_COMMON_DIR` variables,
+  `--git-dir`, `--work-tree`).
 
 When git shows no text diff for a file (because it is binary, or because `.gitattributes` marks it
 `-diff` or `binary`), pii-guard reads the content that will be committed: the staged blob
@@ -185,7 +186,9 @@ or an allow marker, always get the permission prompt (`ask`), in every mode.
 
 ## Configuration
 
-pii-guard reads up to two optional JSON files and merges them:
+Exceptions are yours to set: allowed e-mail domains and local parts, exact values, ignored paths,
+inline allow markers and commit trailers. pii-guard reads up to two optional JSON files and merges
+them:
 
 1. **User config**: `~/.config/pii-guard/pii-guard.json` (or `pii-guard/pii-guard.json` in the
    directory that `XDG_CONFIG_HOME` names, or the path in `PII_GUARD_CONFIG`).
@@ -271,8 +274,12 @@ python3 scripts/pii_guard.py scan path/to/file ...
 - **Commit scanning is best effort.** It reads the staged state when the hook runs. Complex shell
   constructs (aliases, scripts that call `git commit`, `git add` of specific paths) may be scanned
   less precisely; the next commit is checked again.
-- **Masked output still hints at the value** (first and last characters). It goes to your Claude
-  session, which already has the full value.
+- **Masked output still hints at the value.** An e-mail address keeps the first character of the
+  local part and of the domain, and the top-level domain; a PESEL keeps its last two digits; phone,
+  IBAN and card numbers keep their first two and last two characters (only the first character
+  when they are short), and their length and separators are visible; a private phrase keeps its
+  first character and its length. The output goes to your Claude session, which already has the
+  full value.
 - The PreToolUse hook runs only for tool calls in Claude Code. Files you edit yourself and commits
   you make outside Claude Code are not checked; for those, call `scan` from a git pre-commit hook or
   CI.
@@ -304,13 +311,14 @@ See `SECURITY.md` and `PRIVACY.md`.
 
 ## Compatibility
 
-Verified on **2026-10-22** against the Claude Code documentation at code.claude.com/docs (Hooks
-reference: `PreToolUse` input on stdin, exit codes, `hookSpecificOutput.permissionDecision`
-`deny`/`ask`; Plugins: `.claude-plugin/plugin.json`, `hooks/hooks.json`, the `CLAUDE_PLUGIN_ROOT`
-path variable, exec form with `args`; Plugin marketplaces: `.claude-plugin/marketplace.json`,
-relative source `"."`) and with `claude plugin validate --strict` and a local
-`claude plugin marketplace add` / `claude plugin install` on Claude Code 2.1.308. `onFailure` was
-checked in the hooks reference and in the Claude Code changelog (added in 2.1.295). Hook formats
+Verified on **2026-10-23** with `claude plugin validate --strict` on Claude Code 2.1.309, and
+against the plugin manifest reference at code.claude.com/docs (`plugin.json` fields, including the
+directory listing fields). Earlier, on 2026-10-22, against the rest of the Claude Code documentation
+(Hooks reference: `PreToolUse` input on stdin, exit codes, `hookSpecificOutput.permissionDecision`
+`deny`/`ask`; Plugins: `hooks/hooks.json`, the `CLAUDE_PLUGIN_ROOT` path variable, exec form with
+`args`; Plugin marketplaces: `.claude-plugin/marketplace.json`, relative source `"."`) and with a
+local `claude plugin marketplace add` / `claude plugin install` on Claude Code 2.1.308. `onFailure`
+was checked in the hooks reference and in the Claude Code changelog (added in 2.1.295). Hook formats
 change; if something stops working, check the current documentation first.
 
 The hook answers with exit code 0 and a JSON object: `permissionDecision: "deny"` (block),

@@ -361,6 +361,167 @@ class TestLineContinuationsAndLooseForms(HookCase):
         self.assertIn("a.txt, line 1: email address", self.reason(out))
 
 
+class TestHiddenGitAndQuotedMentions(HookCase):
+    """Git hidden behind variables or $'...' asks; quoted text that only mentions git is not a command."""
+
+    def setUp(self):
+        super().setUp()
+        self.git("init", "-q")
+
+    def stage(self, content):
+        (self.repo / "a.txt").write_text(content)
+        self.git("add", "a.txt")
+
+    def test_variable_or_ansi_c_git_asks(self):
+        self.stage("hello\n")
+        for command in ("git $'\\x63ommit' -m x",
+                        "g=git; $g commit -m x",
+                        "g=git; ${g} commit -m x",
+                        "$'\\x67it' commit -m x",
+                        "$(which git) commit -m x",
+                        "git -c $SETTING commit -m x"):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "ask")
+            self.assertIn("does not expand", out["hookSpecificOutput"]["permissionDecisionReason"], command)
+
+    def test_hidden_git_with_staged_data_reports_it(self):
+        self.stage("contact %s\n" % ALICE)
+        code, out, _ = self.run_hook("Bash", {"command": "g=git; $g commit -m x"})
+        self.assertDecision(out, "deny")
+        self.assertIn("a.txt, line 1: email address", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_quoted_mentions_of_git_are_not_commands(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ('grep -rn "git commit" README.md',
+                        "rg 'git add -A && git commit' .",
+                        'echo "run git commit -m x later"',
+                        "$EDITOR notes.txt",
+                        '"$PYTHON" -m unittest'):
+            self.assertEqual(self.run_hook("Bash", {"command": command})[:2], (0, None), command)
+
+    def test_other_command_runners_are_followed(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ("find . -exec sh -c 'git commit -m x' \;",
+                        "find . -execdir bash -c 'git commit -m x' {} +",
+                        'busybox sh -c "git commit -m x"',
+                        'su -c "git commit -m x"',
+                        "env -S 'git commit -m x'",
+                        "bash <<< 'git commit -m x'",
+                        'python3 -c "import os; os.system(\'git commit -m x\')"',
+                        'ssh localhost "git commit -m x"',
+                        "awk 'BEGIN{system(\"git commit -m x\")}'",
+                        "sed -n '1e git commit -m x' a.txt"):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "deny")
+            self.assertIn("a.txt, line 1: email address", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_text_piped_into_a_shell_and_git_subcommands_that_run_commands(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ('echo "git commit -m x" | sh',
+                        'echo "git commit -m x" | bash -s',
+                        "printf '%s\\n' 'git commit -m x' | zsh",
+                        'git submodule foreach "git commit -m x"',
+                        'git submodule foreach --recursive "git commit -m x"',
+                        'git rebase -x "git commit --amend --no-edit" HEAD~1',
+                        'git rebase --exec="git commit --amend --no-edit" HEAD~1',
+                        'git bisect run sh -c "git commit -m x"',
+                        'git filter-branch --tree-filter "git commit -m x" HEAD',
+                        'git difftool --extcmd "git commit -m x"'):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "deny")
+            self.assertIn("a.txt, line 1: email address", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_text_written_to_a_file_and_run_is_a_command(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ("echo 'git commit -m x' > s.sh && sh s.sh",
+                        'printf "git commit -m x\\n" > s.sh; bash s.sh',
+                        "echo 'git commit -m x' > s.sh && chmod +x s.sh && ./s.sh",
+                        "echo 'git commit -m x' > s.txt && cat s.txt | sh",
+                        "{ echo 'git commit -m x'; } > s; sh s",
+                        "echo 'git commit -m x' > s && . ./s",
+                        "echo 'git commit -m x' > s.txt && sh < s.txt",
+                        "echo 'git commit -m x' > s.py && python3 s.py",
+                        "echo 'git commit -m x' &> s; sh s",
+                        "printf 'git commit -m x\\n' | tee x && bash x",
+                        'echo "git commit -m x" | python3',
+                        'echo "git commit -m x" | xargs -I{} ssh host {}'):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "deny")
+            self.assertIn("a.txt, line 1: email address", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_text_written_to_a_script_file_asks(self):
+        self.stage("hello\n")
+        for command in ('echo "git commit -m x" >> s.sh',
+                        'echo "git commit -m x" > deploy',
+                        'echo "git commit -m x" | tee run.bash'):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "ask")
+            self.assertIn("does not parse", out["hookSpecificOutput"]["permissionDecisionReason"], command)
+
+    def test_text_written_to_a_data_file_stays_silent(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ('echo "git commit" > notes.md',
+                        'echo "git commit -m x" >> notes.md',
+                        'echo "run git commit -m x" >> notes.md && cat notes.md',
+                        'echo "git commit -m x" | tee log.txt'):
+            self.assertEqual(self.run_hook("Bash", {"command": command})[:2], (0, None), command)
+
+    def test_git_subcommand_that_does_not_only_read_asks(self):
+        self.stage("hello\n")
+        for command in ('git tag -m "release after git commit" v1',
+                        '{ echo "git commit -m x"; } > s.sh'):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "ask")
+            self.assertIn("does not parse", out["hookSpecificOutput"]["permissionDecisionReason"], command)
+
+    def test_commit_inside_an_unparsed_program_asks(self):
+        self.stage("hello\n")
+        for command in ('python3 -c "import os; os.system(\'git commit -m x\')"',
+                        'ssh localhost "git commit -m x"',
+                        "node -e \"require('child_process').execSync('git add -A')\"",
+                        "sed -n '/git commit/p' notes.md"):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "ask")
+            self.assertIn("does not parse", out["hookSpecificOutput"]["permissionDecisionReason"], command)
+
+    def test_text_tools_that_mention_git_commit_stay_silent(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ('grep -rn "git commit" README.md',
+                        "rg 'git add -A' .",
+                        'echo "git commit -m x"',
+                        "printf '%s\\n' 'git commit -m x'",
+                        'gh pr create --title t --body "Run git commit -m x after review"',
+                        'git log --grep "git commit"',
+                        'gh api -X POST repos/o/r/issues --field body="git commit"',
+                        'echo "git commit -m x" | grep commit',
+                        'git config --get alias.save "git commit"'):
+            self.assertEqual(self.run_hook("Bash", {"command": command})[:2], (0, None), command)
+
+    def test_ansi_c_commit_message_is_an_ordinary_commit(self):
+        self.stage("hello\n")
+        self.assertEqual(self.run_hook("Bash", {"command": "git commit -m $'first line\\nsecond line'"})[:2],
+                         (0, None))
+
+    def test_command_lines_inside_arguments_are_still_split(self):
+        self.stage("contact %s\n" % ALICE)
+        for command in ('bash -lc "git commit -m x"',
+                        "zsh -c 'git commit -m x'",
+                        'eval "git commit -m x"',
+                        'pwsh -Command "git commit -m x"',
+                        'echo "$(git commit -m x)"',
+                        "echo `git commit -m x`"):
+            code, out, _ = self.run_hook("Bash", {"command": command})
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "deny")
+
+
 @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
 class TestReadTextRace(unittest.TestCase):
     def test_file_swapped_for_a_fifo_after_the_check_is_not_read(self):

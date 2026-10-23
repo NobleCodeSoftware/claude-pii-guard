@@ -9,7 +9,7 @@ The hook checks what Claude is about to write (`Write`, `Edit`, `MultiEdit`, `No
 (`git commit` from `Bash` or `PowerShell`). If it finds personal data, it blocks the call (or warns,
 or asks you, as you prefer) and tells Claude where the value is, masked.
 
-> Status: early release (v0.1.0). A single Python file using only the standard library, plus tests.
+> Status: early release (v0.1.1). A single Python file using only the standard library, plus tests.
 > Read "Limitations" before you rely on it.
 
 ## The problem
@@ -45,7 +45,7 @@ Requirements:
   this field, so older versions are not supported: at best they ignore it and the hook fails open
   (a crash or timeout lets the action through).
 - `python3` (3.8 or newer) on `PATH`, and `git` for commit scanning. **Without `python3` every
-  `Write`, `Edit`, `Bash` and `PowerShell` call is blocked** (see "If the hook fails").
+  `Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash` and `PowerShell` call is blocked** (see "If the hook fails").
 
 The plugin works with the defaults; configuration is optional. Run `/reload-plugins` or start a new
 session after installing.
@@ -75,13 +75,31 @@ What is scanned:
   reported again, so you can edit near existing data without noise. Line numbers refer to the file.
 - `git commit` (also `git -C dir commit`, `git -C "my repo" commit`, `git -c user.name="A B" commit`,
   `cd dir && git commit`, `pushd dir && git commit`, `/usr/bin/git commit`,
-  `bash -c 'git commit ...'`, `sh -c "..."`; backslash-newline line continuations are joined as
-  bash does, the command is split into shell words and global git options are skipped with their
-  values): the staged diff (`git diff --cached`, added lines only), the commit command including
-  `-m` messages, and `-F` message files. With `git commit -a` or `git add ... && git commit` in the
-  same command, unstaged changes are scanned too, and with `git add -A` or `git add .` also untracked
-  files. Commit trailers such as `Signed-off-by:` and `Co-authored-by:` are allowed (switch off
-  with `"allow_trailers": false`).
+  `bash -c 'git commit ...'`, `sh -c "..."`, `bash <<< '...'`, `busybox sh -c`, `su -c`,
+  `find -exec sh -c`, `env -S '...'`, `eval "..."`, `pwsh -Command "..."`, `$(git commit ...)`,
+  `echo '...' | sh`, `git submodule foreach '...'`, `git rebase -x '...'`, `git bisect run ...`,
+  `git filter-branch --tree-filter '...'`, `git difftool --extcmd '...'`; backslash-newline line
+  continuations are joined as bash does, the command is split into shell words and global git
+  options are skipped with their values): the staged diff (`git diff --cached`, added lines only),
+  the commit command including `-m` messages, and `-F` message files. With `git commit -a` or
+  `git add ... && git commit` in the same command, unstaged changes are scanned too, and with
+  `git add -A` or `git add .` also untracked files. Commit trailers such as `Signed-off-by:` and
+  `Co-authored-by:` are allowed (switch off with `"allow_trailers": false`).
+- Quoted text that only mentions `git commit` is not treated as a command when it is an argument
+  of a text tool (`grep`, `rg`, `ag`, `ack`, `echo`, `printf`, `jq`, `cat`, `tee`, `gh`), for
+  example the pattern in `grep "git commit"`. For `git`, only subcommands that read data count as
+  text tools (`log`, `show`, `grep`, `diff`, `status`, `blame`, `shortlog`, `describe`, `rev-parse`,
+  `ls-files`, `cat-file`, `help`, `config --get` and similar, plus `commit` for its own message).
+  This holds only when the command line runs nothing at all: if it also contains a shell (`sh`,
+  `bash`, `zsh`, `dash`, `ksh`, `ash`, `fish`, `busybox`, `pwsh`, `powershell`), `source` or `.`,
+  `exec`, `eval`, `xargs`, an interpreter (`python`, `perl`, `ruby`, `node`, `php`, `lua` and
+  similar), `ssh`, a command word that is a path (`./s.sh`, `/usr/bin/git`), or a runner the hook
+  follows (`find -exec`, `env -S`, `su -c`, `git rebase -x` and the like), the text tools' quoted
+  arguments are split as commands. So `echo '...' > s.txt && cat s.txt | sh` and
+  `{ echo '...'; } > s; sh s` are scanned as commits. Text written to a file that looks like a script
+  (ending in `.sh`, `.bash`, `.zsh`, `.ksh`, `.ps1` or `.command`, or with no extension) may be run by
+  a later tool call, so a mention of `git commit` or `add` in it is scanned and asks; writing to
+  `.md`, `.txt` and other data files stays silent.
 
 Content that could not be scanned: up to `max_scan_bytes` (default 5 MB) per file, diff or message
 is scanned, in 1 MB pieces. The following is **not** allowed silently; in `block` and `ask` mode you
@@ -99,6 +117,15 @@ get the permission prompt, in `warn` mode a warning:
   subcommand such as `log` or `help` in between) when the shell-word parser does not find that
   subcommand, for example because of an unclosed quote or an unknown option: it is scanned as a
   commit in the current directory and you are asked as well;
+- a commit whose `git` or subcommand comes from a variable, a command substitution or ANSI-C
+  quoting (`g=git; $g commit`, `${g} commit`, `git $'\x63ommit'`, `$(which git) commit`), which the
+  hook does not expand: the commit is scanned and you are asked as well. A variable as the command
+  word asks only when the command also mentions `git` or `commit`, or uses `$'...'` escapes;
+- a quoted argument of any other program that looks like `git ... commit` or `add`
+  (`python3 -c "...os.system('git commit')"`, `node -e`, `ssh host "git commit"`, and `awk` or
+  `sed`, which can run commands with `system()` or `e`; a git subcommand that does not only read
+  data, such as `git tag -m "..."`; text written to a script-like file): the
+  hook does not parse those programs, so the commit is scanned and you are asked as well;
 - a git alias defined in the command (`git -c alias.<name>=...`, `--config-env alias...`), since it can
   run `commit` under another name: the commit is scanned and you are asked as well;
 - a `cd`, `pushd` or `-C` directory before the commit that the hook cannot resolve (it does not
@@ -221,8 +248,20 @@ python3 scripts/pii_guard.py scan path/to/file ...
   hook does not inspect (for example `echo ... > file`, `cp`, `curl -o`, a script, or a tool from an
   MCP server). Only file tools and `git commit` are scanned for data.
 - **Only `git commit` is inspected.** Other git commands that create commits are not: `git merge`,
-  `git cherry-pick`, `git rebase`, `git am`, `git stash` and `git commit-tree`. Neither are aliases,
-  wrapper scripts or `git commit` hidden behind variables or `eval`.
+  `git cherry-pick`, `git rebase`, `git am`, `git stash` and `git commit-tree`. Neither are shell
+  aliases, shell functions, git aliases from your git config, or wrapper scripts. `git` hidden
+  behind a variable or `$'...'` asks (see "What is scanned"), but other indirection, such as a
+  command built from pieces at run time, is not followed.
+- **Commands run by other programs are asked about, not parsed.** A `git commit` inside
+  `python -c`, `node -e`, `ssh host "..."`, `awk`, `sed` and similar is recognised only by its text: the current
+  repository is scanned and you are asked. A commit those programs build from pieces is not seen.
+- **Text that mentions `git commit` can count as a commit.** For example a heredoc that writes a
+  file containing the words (`cat > notes.md <<EOF ... git commit ... EOF`) is treated as a commit,
+  so the staged changes are scanned. A quoted `git commit` in an `awk` or `sed` program, even a plain
+  search such as `sed -n '/git commit/p'`, is scanned and asks, because both can run commands.
+  And when a command line runs anything (a shell, an interpreter, a path such as `./build.sh` or
+  `/usr/bin/git`), every quoted `git commit` in a text tool's arguments is treated as a commit, for
+  example `grep "git commit" README.md && bash build.sh`.
 - **Commit scanning is best effort.** It reads the staged state when the hook runs. Complex shell
   constructs (aliases, scripts that call `git commit`, `git add` of specific paths) may be scanned
   less precisely; the next commit is checked again.

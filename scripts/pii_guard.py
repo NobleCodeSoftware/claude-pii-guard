@@ -35,7 +35,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Shared deadline for one hook run, in seconds. Keep it well below the "timeout" in hooks/hooks.json
 # (15 s), which also has to cover starting Python.
@@ -675,6 +675,10 @@ ADD_ALL_ARGS = ("-A", "--all", ".", "*", ":/")
 SHELL_EXPANSION_RE = re.compile(r"[$`*?\[{]|^~[^/]")
 
 
+GIT_WORD_RE = re.compile(r"(?<![\w.-])(?:git|commit)(?![\w-])")
+ANSI_C_ESCAPE_RE = re.compile(r"\$'[^']*\\")
+
+
 def join_continuations(command):
     """Remove backslash-newline line continuations as bash does (not inside single quotes)."""
     out, i, n, single, double = [], 0, len(command), False, False
@@ -720,6 +724,8 @@ class GitCommand(object):
         self.redirected = False     # GIT_DIR=, GIT_INDEX_FILE=, --git-dir, --work-tree ...
         self.alias = False          # `git -c alias.x=...`: an alias may run commit under another name
         self.parse_failed = False   # it looks like git commit or add, but the tokens did not show it
+        self.obfuscated = False     # git or its subcommand comes from a variable or ANSI-C quoting
+        self.indirect = False       # a quoted `git commit` run by a program the hook does not parse
         self.unresolved_dir = None  # a cd, pushd or -C directory the hook cannot follow
 
 
@@ -731,24 +737,47 @@ def _change_dir(current, value, result):
     return os.path.join(current, os.path.expanduser(value))
 
 
+def _expansion_is_command(tokens, i):
+    """For `$` + `(`: True only when the substitution's output is run with arguments
+    (`$(which git) commit`). Its inner command is parsed on its own, so `echo "$(git commit)"` is
+    not treated as hidden. Any other `$...` word in command position is an expansion."""
+    if tokens[i] != "$" or i + 1 >= len(tokens) or tokens[i + 1] != "(":
+        return True
+    depth, k = 0, i + 1
+    while k < len(tokens):
+        depth += {"(": 1, ")": -1}.get(tokens[k], 0)
+        if depth == 0:
+            break
+        k += 1
+    return k + 1 < len(tokens) and tokens[k + 1] not in SHELL_SEPARATORS
+
+
 def parse_git_command(command, cwd):
     """Find `git commit` and `git add` in the shell tokens, skipping global options and their values."""
     command = join_continuations(command or "")
     result = GitCommand(cwd)
     result.alias = bool(GIT_ALIAS_RE.search(command))
+    hidden = []
     try:
-        tokens, split_failed = _split(command), False
+        tokens, split_failed = _split(command, 0, hidden), False
+        result.indirect = bool(hidden)
     except ValueError:
         tokens, split_failed = [], True
         result.redirected = bool(re.search(r"(?:^|[\s:])(?:GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|"
                                            r"GIT_OBJECT_DIRECTORY|GIT_COMMON_DIR)=|--git-dir|--work-tree",
                                            command))
     target, found_commit, moved = cwd, False, False
+    cmds = _command_words(tokens)
+    mentions_git = bool(GIT_WORD_RE.search(command))
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if GIT_REDIRECT_ENV_RE.search(tok):
             result.redirected = True
+        # A variable, command substitution or ANSI-C string as the command word can hide git.
+        if (cmds[i] == i and tok.lstrip("`").startswith("$") and _expansion_is_command(tokens, i)
+                and (mentions_git or ANSI_C_ESCAPE_RE.search(command))):
+            result.obfuscated = True
         if tok in DIRECTORY_COMMANDS:
             value = tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1] not in SHELL_SEPARATORS else None
             target, moved = _change_dir(target, value, result), True
@@ -768,6 +797,8 @@ def parse_git_command(command, cwd):
                     local, local_moved = _change_dir(local, tokens[j + 1], result), True
                 elif opt in ("-c", "--config-env") and tokens[j + 1].lower().startswith("alias."):
                     result.alias = True
+                elif opt in ("-c", "--config-env") and tokens[j + 1].startswith("$"):
+                    result.obfuscated = True
                 j += 2
             else:
                 j += 1
@@ -777,6 +808,8 @@ def parse_git_command(command, cwd):
         while k < len(tokens) and tokens[k] not in SHELL_SEPARATORS and not _is_git(tokens[k]):
             args.append(tokens[k])
             k += 1
+        if sub.startswith("$") or "`" in sub or "$(" in sub:
+            result.obfuscated = True  # the subcommand is a variable, substitution or ANSI-C string
         if sub == "commit":
             result.commit = True
             if not found_commit:
@@ -789,27 +822,22 @@ def parse_git_command(command, cwd):
             result.add = True
             if any(a in ADD_ALL_ARGS for a in args):
                 result.add_all = True
+        elif sub not in OTHER_GIT_SUBCOMMANDS:
+            # An unknown option or value before the subcommand: `git --frobnicate value commit`.
+            for a in args:
+                if a in ("commit", "add"):
+                    result.parse_failed = True
+                    break
+                if a in OTHER_GIT_SUBCOMMANDS:
+                    break
         i = k
-    # Forms the tokens hide, such as `git commit` inside backticks, are found by the older pattern;
-    # anything else that still looks like git commit or add is scanned and the user is asked.
-    if not result.commit and GIT_COMMIT_RE.search(command):
-        result.commit = True
-    if not result.commit and _loose_git(command, "commit"):
-        result.commit = result.parse_failed = True
-    if not result.add and _loose_git(command, "add"):
-        result.add = result.add_all = True
-        result.parse_failed = result.parse_failed or result.commit
-    add = GIT_ADD_RE.search(command)
-    if add:
-        result.add = True
-        if re.search(r"(?:^|\s)(?:-A|--all|\.|\*|:/)(?:\s|$)", add.group(1) + " "):
-            result.add_all = True
-    if re.search(r"\bcommit\b[^;&|\n]*\s(?:-[A-Za-z]*a[A-Za-z]*|--all)\b", command):
-        result.commit_all = True
-    if result.alias:
-        result.commit = True  # the alias may be commit; scan the commit and ask
-    if split_failed and (result.commit or result.add):
-        result.commit = result.parse_failed = True
+    if split_failed:
+        # Without tokens, anything that looks like git commit or add is scanned and the user is asked.
+        result.parse_failed = bool(GIT_COMMIT_RE.search(command) or GIT_ADD_RE.search(command)
+                                   or _loose_git(command, "commit") or _loose_git(command, "add"))
+        result.obfuscated = result.obfuscated or bool(ANSI_C_ESCAPE_RE.search(command) and mentions_git)
+    if result.alias or result.obfuscated or result.parse_failed or result.indirect:
+        result.commit = True  # scan the commit and ask
     if result.parse_failed:
         result.commit_all = result.add_all = result.add = True
     return result
@@ -848,24 +876,245 @@ def _git(args, cwd, limit, deadline):
     return GitResult(res.stdout[:limit].decode("utf-8", errors="replace"), len(res.stdout) > limit)
 
 
-_RUNS_GIT_RE = re.compile(r"(?:^|[\s;&|(`'\"\\/=])git(?:\.exe)?\b")
+SHELL_NAMES = {"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"}
+POWERSHELL_NAMES = {"pwsh", "powershell"}
+# Words after which the next word is again a command: shell keywords and command wrappers.
+SHELL_KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time"}
+COMMAND_WRAPPERS = {"env", "sudo", "doas", "command", "builtin", "exec", "nohup", "nice", "xargs",
+                    "busybox"}
+# Programs whose `-c` argument is a command line, and the `find` options that start a command.
+C_FLAG_RUNNERS = SHELL_NAMES | {"su"}
+FIND_EXEC_OPTIONS = ("-exec", "-execdir", "-ok", "-okdir")
+# Programs that only print or search text: a quoted argument of theirs that mentions `git commit` is
+# not a command, as long as nothing in the command line runs anything (EXECUTING_PROGRAMS). Any
+# other program's quoted argument that looks like one (python -c, node -e, ssh host "...", and awk
+# or sed, which can run commands) is not parsed, so the commit is scanned and the user is asked.
+NON_EXECUTING_PROGRAMS = {"grep", "rg", "ag", "ack", "echo", "printf", "jq", "cat", "gh", "git"}
+# Git subcommands that only read data; for `git`, the exemption above applies only to these (and to
+# `commit`, whose own message is not run). `config` counts only with a read option.
+DATA_ONLY_GIT_SUBCOMMANDS = {
+    "commit", "log", "show", "grep", "diff", "status", "blame", "shortlog", "describe", "rev-parse",
+    "rev-list", "help", "ls-files", "ls-tree", "cat-file", "reflog", "whatchanged", "name-rev",
+    "for-each-ref", "show-ref", "count-objects", "var", "version",
+}
+GIT_CONFIG_READ_OPTIONS = ("--get", "--get-all", "--get-regexp", "--list", "-l", "get", "list")
+# Git subcommands that run a command line given as an argument.
+GIT_EXEC_OPTIONS = ("-x", "--exec", "--extcmd", "--tree-filter", "--index-filter", "--msg-filter",
+                    "--env-filter", "--commit-filter", "--parent-filter", "--tag-name-filter")
+GIT_EXEC_SUBCOMMANDS = ("rebase", "difftool", "mergetool", "filter-branch")
+# Programs that run commands, scripts or code. When any of them (or a command word that is a path)
+# appears anywhere in a command line, text written or piped by a text tool may be run, so the
+# text-tool exemption does not apply to that command line.
+EXECUTING_PROGRAMS = SHELL_NAMES | POWERSHELL_NAMES | {
+    "source", ".", "exec", "eval", "xargs", "busybox", "su", "parallel", "watch", "script", "tmux",
+    "screen", "flock", "perl", "ruby", "node", "nodejs", "deno", "bun", "php", "lua", "luajit",
+    "tclsh", "rscript", "osascript", "ssh",
+}
+INTERPRETER_RE = re.compile(r"^(?:python|pypy)[0-9.]*$")
+GIT_RUNNING_SUBCOMMANDS = {"rebase", "filter-branch", "difftool", "mergetool", "submodule", "bisect"}
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-def _split(command, depth=0):
-    """Shell-like tokens; a quoted argument that itself runs git (bash -c '...') is split again.
+def _program(tok):
+    name = os.path.basename(tok.strip("`").replace("\\", "/")).lower()
+    return name[:-4] if name.endswith(".exe") else name
 
+
+def _git_subcommand(toks, git_index):
+    """Index of the subcommand after `git` and its global options, or None."""
+    j = git_index + 1
+    while j < len(toks) and toks[j].startswith("-") and toks[j] not in SHELL_SEPARATORS:
+        j += 2 if toks[j] in GIT_VALUE_OPTIONS else 1
+    return j if j < len(toks) and toks[j] not in SHELL_SEPARATORS else None
+
+
+def _command_words(toks):
+    """For each token, the index of the command word of its simple command, or None.
+
+    The command word is the first word of a segment after variable assignments, shell keywords and
+    wrappers such as `env` or `sudo` (and their options); a backtick also starts a command, and so do
+    `find -exec`, `git submodule foreach` and `git bisect run`."""
+    out, cmd, pending = [], None, True
+    for n, t in enumerate(toks):
+        if t in SHELL_SEPARATORS:
+            out.append(None)
+            cmd, pending = None, True
+            continue
+        if t.startswith("`"):
+            pending = True
+        if n > 0 and cmd is not None:
+            program, prev = _program(toks[cmd]), toks[n - 1]
+            if program == "find" and prev in FIND_EXEC_OPTIONS:
+                pending = True
+            elif program == "git" and (prev == "foreach" or (prev == "run" and n > 1 and toks[n - 2] == "bisect")):
+                pending = True
+        if pending:
+            bare = t.lstrip("`")
+            wrapped = cmd is not None and _program(toks[cmd]) in COMMAND_WRAPPERS
+            if bare in SHELL_KEYWORDS or ASSIGNMENT_RE.match(bare) or (wrapped and bare.startswith("-")):
+                out.append(None)
+                continue
+            cmd = n
+            pending = _program(bare) in COMMAND_WRAPPERS
+        out.append(cmd)
+    return out
+
+
+def _has_execution(toks, cmds):
+    """True when the command line runs something that could execute text a text tool wrote:
+    a shell, an interpreter, source/exec/eval/xargs, a command word that is a path, `find -exec`,
+    `env -S`, or a git subcommand that runs commands."""
+    for n, t in enumerate(toks):
+        cmd = cmds[n]
+        if cmd is None:
+            continue
+        program = _program(toks[cmd])
+        if cmd == n:
+            if program in EXECUTING_PROGRAMS or INTERPRETER_RE.match(program) or "/" in t.strip("`"):
+                return True
+            continue
+        if program == "find" and t in FIND_EXEC_OPTIONS:
+            return True
+        if program == "env" and (t in ("-S", "--split-string") or t.startswith("--split-string=")):
+            return True
+        if program == "git" and t in GIT_RUNNING_SUBCOMMANDS and _git_subcommand(toks, cmd) == n:
+            return True
+    return False
+
+
+def _runs_as_command(toks, cmds, n):
+    """True when token n is itself a command line: `sh -c '...'`, `eval '...'`, `pwsh -Command '...'`,
+    `git rebase -x '...'`, `git submodule foreach '...'` or a command substitution (`$(...)`,
+    backticks). Other quoted arguments, such as the pattern of `grep "git commit"`, are not split
+    again unless the command line also runs something (see _has_execution)."""
+    t = toks[n]
+    if "$(" in t or "`" in t:
+        return True
+    cmd = cmds[n]
+    if cmd is not None and cmd == n and n > 0 and toks[n - 1] in ("foreach", "run"):
+        return True  # `git submodule foreach '...'`, `git bisect run '...'`
+    if cmd is None or cmd >= n:
+        return False
+    program, prev = _program(toks[cmd]), toks[n - 1]
+    if program == "eval":
+        return True
+    if program in C_FLAG_RUNNERS and re.match(r"^-[A-Za-z]*c[A-Za-z]*$", prev):
+        return True
+    if program in SHELL_NAMES and prev == "<<<":
+        return True
+    if program == "git" and prev in GIT_EXEC_OPTIONS:
+        sub = _git_subcommand(toks, cmd)
+        return sub is not None and toks[sub] in GIT_EXEC_SUBCOMMANDS
+    return program in POWERSHELL_NAMES and prev.lower() in ("-c", "-command", "-commandwithargs")
+
+
+def _git_exec_value(toks, cmds, n):
+    """The command line in `git rebase --exec=...` or `git filter-branch --tree-filter=...`, or None."""
+    t, cmd = toks[n], cmds[n]
+    if cmd is None or cmd >= n or _program(toks[cmd]) != "git" or "=" not in t:
+        return None
+    name, value = t.split("=", 1)
+    sub = _git_subcommand(toks, cmd)
+    if name in GIT_EXEC_OPTIONS and sub is not None and toks[sub] in GIT_EXEC_SUBCOMMANDS:
+        return value
+    return None
+
+
+def _env_split_string(toks, n):
+    """`env -S 'git commit -m x'` / `env --split-string=...`: env runs the string as a command line."""
+    if n == 0 or toks[n - 1] not in ("-S", "--split-string"):
+        return False
+    k = n - 1
+    while k > 0 and toks[k - 1] not in SHELL_SEPARATORS:
+        k -= 1
+        if _program(toks[k]) == "env":
+            return True
+    return False
+
+
+REDIRECTIONS = (">", ">>", ">|", "&>", "&>>", "1>")
+TEXT_TOOLS = NON_EXECUTING_PROGRAMS | {"tee"}
+
+
+SCRIPT_EXTENSIONS = (".sh", ".bash", ".zsh", ".ksh", ".ps1", ".command")
+
+
+def _looks_like_script(path):
+    """A file name ending in a script extension, or with no extension at all (devices excluded)."""
+    if path.startswith("/dev/") or path.startswith("&"):
+        return False
+    name = os.path.basename(path.replace("\\", "/")).lower()
+    if not name:
+        return False
+    return name.endswith(SCRIPT_EXTENSIONS) or "." not in name.lstrip(".")
+
+
+def _writes_script_file(toks, cmds):
+    """True when a text tool's output goes to a file that looks like a script (`> s.sh`,
+    `>> run`, `| tee deploy.sh`), which may be run by a later tool call."""
+    for n, t in enumerate(toks):
+        if t in REDIRECTIONS and n + 1 < len(toks) and _looks_like_script(toks[n + 1]):
+            if n > 0 and toks[n - 1] in ("}", ")"):
+                return True  # the output of a group or subshell: `{ echo ...; } > s.sh`
+            k = n - 1
+            while k >= 0 and cmds[k] is None and toks[k] not in SHELL_SEPARATORS:
+                k -= 1
+            if k >= 0 and cmds[k] is not None and _program(toks[cmds[k]]) in NON_EXECUTING_PROGRAMS:
+                return True
+        elif cmds[n] is not None and cmds[n] < n and _program(toks[cmds[n]]) == "tee":
+            if not t.startswith("-") and t not in SHELL_SEPARATORS and _looks_like_script(t):
+                return True
+    return False
+
+
+def _exempt_text_argument(toks, cmds, n, script_write=False):
+    """True when token n is an argument of a text-only program whose output is not piped onward
+    to anything but text-only programs, so a `git commit` in it is only text."""
+    cmd = cmds[n]
+    if cmd is None or cmd >= n:
+        return False
+    program = _program(toks[cmd])
+    if program not in TEXT_TOOLS or script_write:
+        return False
+    if program == "git":
+        sub = _git_subcommand(toks, cmd)
+        if sub is None or sub >= n:
+            return False
+        if toks[sub] == "config":
+            return any(a in GIT_CONFIG_READ_OPTIONS for a in toks[sub + 1:n + 1])
+        return toks[sub] in DATA_ONLY_GIT_SUBCOMMANDS
+    return True
+
+
+def _split(command, depth=0, hidden=None):
+    """Shell-like tokens; an argument that is itself a command line (bash -c '...') is split again.
+
+    A quoted argument that looks like `git ... commit` or `add` but is run by a program the hook does
+    not parse (python -c, ssh ...) is appended to `hidden`, if given.
     Raises ValueError when the command cannot be tokenised (for example an unclosed quote)."""
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     toks = list(lex)
+    cmds = _command_words(toks)
+    execution = _has_execution(toks, cmds)
+    script_write = _writes_script_file(toks, cmds)
     out = []
-    for t in toks:
-        if depth < 3 and re.search(r"\s", t) and _RUNS_GIT_RE.search(t):
-            out.append(";")
-            out.extend(_split(t, depth + 1))
-            out.append(";")
-        else:
-            out.append(t)
+    for n, t in enumerate(toks):
+        if depth < 3 and re.search(r"\s", t):
+            inner = _git_exec_value(toks, cmds, n)
+            if inner is None and (_runs_as_command(toks, cmds, n) or _env_split_string(toks, n)
+                                  or (execution and cmds[n] is not None and cmds[n] < n
+                                      and _program(toks[cmds[n]]) in TEXT_TOOLS)):
+                inner = t
+            if inner is not None:
+                out.append(";")
+                out.extend(_split(inner, depth + 1, hidden))
+                out.append(";")
+                continue
+        if (hidden is not None and re.search(r"\s", t) and (_loose_git(t, "commit") or _loose_git(t, "add"))
+                and not _exempt_text_argument(toks, cmds, n, script_write)):
+            hidden.append(t)
+        out.append(t)
     return out
 
 
@@ -1003,6 +1252,14 @@ def commit_sources(command, cwd, config, notes, deadline, parsed=None):
         sources.append(Source("git command", "", 1, None,
                               unscanned="the command could not be parsed; it was scanned as a commit "
                               "in the current directory"))
+    if parsed.obfuscated:
+        sources.append(Source("git command", "", 1, None,
+                              unscanned="git or its subcommand comes from a variable, a command "
+                              "substitution or $'...' quoting, which the hook does not expand"))
+    if parsed.indirect:
+        sources.append(Source("git command", "", 1, None,
+                              unscanned="a quoted argument looks like a git commit run by another "
+                              "program (for example python -c or ssh), which the hook does not parse"))
     if parsed.alias:
         sources.append(Source("git command", "", 1, None,
                               unscanned="it defines a git alias, which the hook does not follow"))

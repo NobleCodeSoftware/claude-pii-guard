@@ -1,0 +1,22 @@
+{
+  "description": "pii-guard: scan file writes and git commits for personal data before they happen",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/pii_guard.py"
+            ],
+            "timeout": 15,
+            "onFailure": "block",
+            "statusMessage": "pii-guard: scanning for personal data"
+          }
+        ]
+      }
+    ]
+  }
+}

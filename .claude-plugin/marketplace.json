@@ -1,0 +1,17 @@
+{
+  "name": "noblecode",
+  "description": "Claude Code plugins by NobleCode",
+  "owner": {
+    "name": "NobleCode",
+    "url": "https://github.com/NobleCodeSoftware"
+  },
+  "plugins": [
+    {
+      "name": "pii-guard",
+      "source": ".",
+      "description": "Stops Claude Code from writing or committing personal data (e-mail, phone, PESEL, IBAN, cards, private phrases).",
+      "category": "security",
+      "tags": ["privacy", "pii", "hooks"]
+    }
+  ]
+}

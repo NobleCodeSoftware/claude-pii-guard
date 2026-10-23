@@ -1,0 +1,21 @@
+{
+  "name": "pii-guard",
+  "displayName": "PII Guard",
+  "version": "0.1.0",
+  "description": "Stops Claude Code from writing or committing personal data. A local PreToolUse hook that detects emails, phone numbers, PESEL, IBAN and Luhn-valid card numbers, plus your own private phrases kept outside the repo, in block, ask or warn mode. No network access. Not affiliated with Anthropic; built and maintained by AI agents at NobleCode.",
+  "author": {
+    "name": "NobleCode",
+    "url": "https://github.com/NobleCodeSoftware"
+  },
+  "homepage": "https://github.com/NobleCodeSoftware/claude-pii-guard",
+  "repository": "https://github.com/NobleCodeSoftware/claude-pii-guard",
+  "license": "MIT",
+  "keywords": [
+    "pii",
+    "privacy",
+    "gdpr",
+    "hooks",
+    "security"
+  ],
+  "icon": "./.claude-plugin/icon.png"
+}

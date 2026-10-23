@@ -1,0 +1,15 @@
+{
+  "mode": "block",
+  "detectors": {
+    "email": true,
+    "phone": true,
+    "pesel": true,
+    "iban": true,
+    "card": true,
+    "phrases": true
+  },
+  "allow_domains": ["mycompany.example"],
+  "allow_values": ["support@example.com"],
+  "ignore_paths": ["tests/fixtures/**", "**/*.snap"],
+  "allow_markers": ["pii-guard: allow"]
+}

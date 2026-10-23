@@ -4,34 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-10-23
+
+Preparation for the Claude plugin directory. The hook's behaviour is unchanged.
+
+### Added
+
+- `PRIVACY.md`: the plugin runs locally and collects, sends and stores no data.
+- `plugin.json`: `documentationUrl`, `supportUrl` and `privacyPolicyUrl` for the directory listing.
+
+### Changed
+
+- The icon moved from `.claude-plugin/` to `assets/icon.png`, since the documentation keeps only
+  the manifests in `.claude-plugin/`.
+- `plugin.json` keywords: `gdpr` replaced by `personal-data`; the plugin does not provide
+  compliance with any law.
+- README: a shorter "What is scanned" section, wrapped lines, a cross-reference between the data
+  file rule and the heredoc limitation, and a limitation for scripts written by an earlier tool
+  call (also when read through a file descriptor). Several shell examples in the README and this
+  changelog are now described in words instead of shell snippets.
+
 ## [0.1.1] - 2026-10-23
 
 ### Changed
 
-- Quoted arguments are split into commands again where another program runs them as a command
-  line: `sh -c`, `bash -c` (also `-lc` and similar), `zsh -c` and other shells, `bash <<< '...'`,
-  `busybox sh -c`, `su -c`, `find -exec sh -c`, `env -S`, `eval`, `pwsh`/`powershell -Command`,
-  command substitution (`$(...)`, backticks), text piped into a shell (`echo '...' | sh`), and git
-  subcommands that run commands (`submodule foreach`, `rebase -x`/`--exec`, `bisect run`,
-  `filter-branch --*-filter`, `difftool`/`mergetool --extcmd`).
-- A quoted argument of a text tool (`grep`, `rg`, `ag`, `ack`, `echo`, `printf`, `jq`, `cat`, `gh`,
-  and `git` with a subcommand that only reads data, such as `log` or `config --get`) is not treated
-  as a command, so `grep -rn "git commit" README.md` or `git log --grep "git commit"` no longer
-  scans the staged changes. This holds only when the command line runs nothing: if it also
-  contains a shell, an interpreter, `source`/`.`, `exec`, `eval`, `xargs`, `ssh`, a command word
-  that is a path, or a runner the hook follows, the text tools' quoted arguments are split as
-  commands (`echo '...' > s.txt && cat s.txt | sh`, `{ echo '...'; } > s; sh s`). Text written to a
-  file that looks like a script (`.sh`, `.bash`, `.zsh`, `.ksh`, `.ps1`, `.command`, or no extension) is scanned as a
-  commit and asks; writing to `.md`, `.txt` and other data files stays silent.
-- A quoted argument of any other program that looks like `git ... commit` or `add` (`python -c`,
-  `node -e`, `ssh host "..."`, `awk` or `sed`, or another git subcommand) is scanned as a commit and
-  asks, because the hook does not parse it.
+- A command line passed to another program is split into commands again and checked: shells with
+  `-c` or a here-string, `busybox`, `su -c`, `find -exec`, `env -S`, `eval`, PowerShell
+  `-Command`, command substitution, text piped into a shell, and git subcommands that run commands
+  (`submodule foreach`, `rebase -x`/`--exec`, `bisect run`, `filter-branch` filters,
+  `difftool`/`mergetool --extcmd`).
+- Quoted text in a text tool (`grep`, `rg`, `ag`, `ack`, `echo`, `printf`, `jq`, `cat`, `tee`,
+  `gh`, and `git` with a subcommand that only reads data, such as `log` or `config --get`) is not
+  treated as a command, so searching a README for the words "git commit" no longer scans the staged
+  changes. This holds only when the command line runs nothing else; if it also starts a shell, an
+  interpreter, a remote session, `source`, `exec`, `eval`, `xargs`, a program given by path or one
+  of the runners above, the quoted text is checked as commands.
+- Text that a text tool writes to a file that looks like a script (`.sh`, `.bash`, `.zsh`, `.ksh`,
+  `.ps1`, `.command`, or no extension) is scanned as a commit and asks; writing to `.md`, `.txt`
+  and other data files stays silent.
+- A quoted `git commit` or `add` in a program the hook does not parse (an interpreter's inline code,
+  a remote shell command, `awk`, `sed`, or a git subcommand that does not only read data) is scanned
+  as a commit and asks.
 
 ### Security
 
-- A commit whose `git` or subcommand comes from a variable, a command substitution or ANSI-C quoting
-  (`g=git; $g commit`, `${g} commit`, `git $'\x63ommit'`, `$(which git) commit`, `git -c $X commit`)
-  is scanned and asks, because the hook does not expand it.
+- A commit whose `git` or subcommand comes from a shell variable, a command substitution or ANSI-C
+  quoting is scanned and asks, because the hook does not expand it.
 
 ### Fixed
 

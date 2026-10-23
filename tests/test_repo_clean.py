@@ -85,6 +85,12 @@ class TestPluginLayout(unittest.TestCase):
         self.assertTrue(plugin["description"].startswith("Stops Claude Code from writing or committing personal data."))
         self.assertIn("Not affiliated with Anthropic", plugin["description"])
         self.assertTrue((ROOT / plugin["icon"]).is_file())
+        self.assertFalse(plugin["icon"].startswith("./.claude-plugin/"))  # only manifests live there
+        self.assertNotIn("gdpr", plugin["keywords"])  # the plugin does not provide compliance
+        for key in ("homepage", "repository", "documentationUrl", "supportUrl", "privacyPolicyUrl"):
+            self.assertTrue(plugin[key].startswith("https://"), key)
+        self.assertTrue(plugin["privacyPolicyUrl"].endswith("/PRIVACY.md"))
+        self.assertTrue((ROOT / "PRIVACY.md").is_file())
 
     def test_ci_actions_pinned_to_sha(self):
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

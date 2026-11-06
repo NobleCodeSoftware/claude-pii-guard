@@ -82,7 +82,7 @@ class TestPluginLayout(unittest.TestCase):
         self.assertFalse(plugin["name"].startswith(("claude-", "anthropic-")))  # reserved prefixes
         self.assertEqual(plugin["license"], "MIT")
         self.assertEqual(plugin["version"], g.VERSION)
-        self.assertTrue(plugin["description"].startswith("Stops Claude Code from writing or committing personal data."))
+        self.assertTrue(plugin["description"].startswith("Catches common personal data before Claude Code writes or commits it."))
         self.assertIn("Not affiliated with Anthropic", plugin["description"])
         self.assertTrue((ROOT / plugin["icon"]).is_file())
         self.assertFalse(plugin["icon"].startswith("./.claude-plugin/"))  # only manifests live there
@@ -130,7 +130,7 @@ class TestPluginLayout(unittest.TestCase):
     def test_no_network_modules(self):
         source = (ROOT / "scripts" / "pii_guard.py").read_text(encoding="utf-8")
         imports = set(re.findall(r"^(?:import|from)\s+([\w.]+)", source, re.M))
-        self.assertTrue(imports <= {"bisect", "fnmatch", "json", "os", "re", "shlex", "stat", "subprocess", "sys", "time"}, imports)
+        self.assertTrue(imports <= {"bisect", "collections", "fnmatch", "hashlib", "json", "os", "re", "shlex", "stat", "subprocess", "sys", "time"}, imports)
         for banned in ("eval(", "exec(", "shell=True", "os.system", "urllib", "socket", "http.client"):
             self.assertNotIn(banned, source)
 

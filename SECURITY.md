@@ -45,8 +45,11 @@ and misconfiguration of your own installation.
 
 - Standard library only; no third-party dependencies to audit or update.
 - No network access. The only subprocess is `git` with a fixed argument list, no shell, a timeout,
-  and `--no-ext-diff`, `--no-textconv`, `diff.external=` and `core.fsmonitor=false`, so programs
-  configured in a repository's git config or `.gitattributes` are not run. A test checks this.
+  and `--no-ext-diff`, `--no-textconv`, `diff.external=` and `core.fsmonitor=false`. `git diff` is
+  run only between the index and `HEAD` (`--cached`), and working-tree files are read by the hook
+  itself and compared with the staged blobs (`git cat-file blob`), so the hook runs no external diff
+  program, textconv driver, fsmonitor hook or clean filter configured in a repository's git config
+  or `.gitattributes`. Tests check this for external diff, textconv and clean filters.
 - Scanned content is only matched with regular expressions; configuration is parsed with `json`.
 - The hook is declared with `onFailure: "block"`: a crash or timeout blocks the action instead of
   letting it through. The scan is linear in the input size and stops after 50 findings. One hook run
@@ -71,5 +74,5 @@ and misconfiguration of your own installation.
   enough: rewrite the history or delete the repository, rotate anything that works as a credential,
   and check your obligations under data protection law (for example GDPR breach notification).
 - If you find a vulnerability, especially one that is actively exploited, report it to us privately
-  and promptly (see "Reporting a vulnerability"). Any reporting duties under the EU Cyber Resilience
-  Act are the maintainer's, and we handle them.
+  and promptly (see "Reporting a vulnerability"). We handle vulnerability reports as described
+  above.

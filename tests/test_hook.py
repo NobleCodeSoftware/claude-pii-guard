@@ -270,6 +270,308 @@ class TestGitCommit(HookCase):
         self.assertFalse(marker.exists(), "a configured diff program was executed")
 
 
+class TestContentFromOutsideTheIndex(HookCase):
+    """`git add PATHS && git commit` and `git commit PATHS` take content that is not staged yet when
+    the hook runs; that content is read from the working tree."""
+
+    PESEL = s.PESELS[0]
+
+    def setUp(self):
+        super().setUp()
+        self.init_repo()
+
+    def commit(self, command):
+        return self.run_hook("Bash", {"command": command, "description": "commit"})
+
+    def commit_now(self, *paths):
+        self.git("add", *paths)
+        self.git("-c", "user.name=Test", "-c", "user.email=%s" % s.EMAILS[3], "commit", "-q", "-m", "init")
+
+    def reason(self, out):
+        self.assertIsNotNone(out)
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_add_of_new_untracked_file_is_scanned(self):
+        (self.repo / "new.csv").write_text("id,pesel\n1,%s\n" % self.PESEL)
+        code, out, _ = self.commit("git add new.csv && git commit -m x")
+        self.assertEqual(code, 0)
+        self.assertDecision(out, "deny")
+        self.assertIn("new.csv (untracked, staged by git add), line 2: PESEL", self.reason(out))
+
+    def test_add_of_clean_untracked_file_is_allowed(self):
+        (self.repo / "new.csv").write_text("id,name\n1,Alice\n")
+        self.assertEqual(self.commit("git add new.csv && git commit -m x")[:2], (0, None))
+
+    def test_add_with_paths_does_not_scan_other_untracked_files(self):
+        (self.repo / "new.csv").write_text("id,name\n1,Alice\n")
+        (self.repo / "other.csv").write_text("1,%s\n" % self.PESEL)
+        self.assertEqual(self.commit("git add new.csv && git commit -m x")[:2], (0, None))
+
+    def test_add_of_modified_tracked_file_is_scanned(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        self.commit_now("a.txt")
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        code, out, _ = self.commit("git add a.txt && git commit -m x")
+        self.assertDecision(out, "deny")
+        self.assertIn("a.txt, line 2: PESEL", self.reason(out))
+
+    def test_add_in_subdirectory_and_directory_pathspec(self):
+        (self.repo / "sub" / "deep").mkdir(parents=True)
+        (self.repo / "sub" / "deep" / "n.csv").write_text("1,%s\n" % self.PESEL)
+        for command in ("cd sub && git add deep/n.csv && cd .. && git commit -m x",
+                        "git -C sub add deep && git commit -m x",
+                        "git add -- sub/ && git commit -m x"):
+            code, out, _ = self.commit(command)
+            self.assertDecision(out, "deny")
+            self.assertIn("sub/deep/n.csv (untracked, staged by git add), line 1: PESEL", self.reason(out))
+
+    def test_commit_with_pathspec_scans_unstaged_change(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        self.commit_now("a.txt")
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        for command in ("git commit -m x a.txt",
+                        "git commit a.txt -m x",
+                        "git commit -o -m x -- a.txt",
+                        "git commit --include --message=x a.txt",
+                        "git commit -m \"$(cat <<'EOF'\nUpdate greeting\nEOF\n)\" a.txt"):
+            code, out, _ = self.commit(command)
+            self.assertEqual(code, 0)
+            self.assertDecision(out, "deny")
+            self.assertIn("a.txt, line 2: PESEL", self.reason(out))
+
+    def test_commit_with_pathspec_of_clean_change_is_allowed(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        (self.repo / "b.txt").write_text("other\n")
+        self.commit_now("a.txt", "b.txt")
+        (self.repo / "a.txt").write_text("hello\nworld\n")
+        (self.repo / "b.txt").write_text("other\nPESEL %s\n" % self.PESEL)
+        self.assertEqual(self.commit("git commit -m x a.txt")[:2], (0, None))
+
+    def test_option_values_are_not_taken_as_pathspecs(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        self.commit_now("a.txt")
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        for command in ("git commit -m a.txt", "git commit -C HEAD", "git commit --author 'A <a.txt>' -m x",
+                        "git commit --fixup HEAD", "git commit -t a.txt -m x"):
+            out = self.commit(command)[1]
+            self.assertNotEqual((out or {}).get("hookSpecificOutput", {}).get("permissionDecision"), "deny",
+                                command)
+
+    def test_forced_add_of_ignored_file_is_scanned(self):
+        (self.repo / ".gitignore").write_text("secret.csv\n")
+        (self.repo / "secret.csv").write_text("1,%s\n" % self.PESEL)
+        code, out, _ = self.commit("git add -f secret.csv && git commit -m x")
+        self.assertDecision(out, "deny")
+        self.assertIn("secret.csv (untracked, staged by git add), line 1: PESEL", self.reason(out))
+        code, out, _ = self.commit("git add --force -A && git commit -m x")
+        self.assertDecision(out, "deny")
+        # Without -f git refuses to add an ignored file, so nothing of it is committed.
+        self.assertEqual(self.commit("git add secret.csv && git commit -m x")[:2], (0, None))
+
+    def test_arguments_that_cannot_be_classified_ask(self):
+        (self.repo / "new.csv").write_text("id,name\n1,Alice\n")
+        for command in ('git add "$F" && git commit -m x',
+                        "git add $(git ls-files -o) && git commit -m x",
+                        "git ls-files -o | xargs git add && git commit -m x",
+                        "git add --pathspec-from-file=list.txt && git commit -m x",
+                        "git commit --frobnicate -m x"):
+            code, out, _ = self.commit(command)
+            self.assertDecision(out, "ask")
+            self.assertIn("could not tell which files", self.reason(out))
+
+    def test_arguments_that_cannot_be_classified_still_scan_everything(self):
+        (self.repo / "new.csv").write_text("1,%s\n" % self.PESEL)
+        code, out, _ = self.commit("git ls-files -o | xargs git add && git commit -m x")
+        self.assertDecision(out, "deny")
+        self.assertIn("new.csv", self.reason(out))
+
+    def test_parser_classifies_options_and_pathspecs(self):
+        p = g.parse_git_command('git add -fv -- a b && git commit -am "m x" 2>&1 | tail', "/r")
+        add, commit = p.path_specs
+        self.assertEqual((add.tracked, add.untracked, add.force, add.problem), (["a", "b"], ["a", "b"], True, None))
+        self.assertEqual((commit.tracked, commit.problem), ([], None))
+        self.assertTrue(p.commit_all)
+        p = g.parse_git_command("git add -u && git commit --mess=x --no-verify c.txt", "/r")
+        add, commit = p.path_specs
+        self.assertEqual((add.tracked, add.untracked), ([], None))
+        self.assertEqual(commit.tracked, ["c.txt"])
+        # A here-document body may hold anything: no prompt, but a word that cannot be classified
+        # makes the whole repository count, so it can never hide a path.
+        p = g.parse_git_command("git commit -F - <<'EOF'\nUse ${name} --here\nEOF", "/r")
+        self.assertIsNone(p.path_specs[0].problem)
+        self.assertIn(":/", p.path_specs[0].tracked)
+        p = g.parse_git_command("git add <<EOF $F\nEOF", "/r")
+        self.assertIn(":/", p.path_specs[0].untracked)
+
+    def test_same_file_name_in_two_repositories(self):
+        (self.repo / "README.md").write_text("hi\n")
+        self.commit_now("README.md")
+        lib = self.repo / "lib"
+        lib.mkdir()
+        for args in (["init", "-q"], ["config", "user.name", "Test"], ["config", "user.email", s.EMAILS[3]]):
+            subprocess.run(["git"] + args, cwd=lib, env=self.env, check=True)
+        (lib / "README.md").write_text("lib\n")
+        subprocess.run(["git", "add", "README.md"], cwd=lib, env=self.env, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=lib, env=self.env, check=True)
+        (lib / "README.md").write_text("lib\nv2\n")
+        (self.repo / "README.md").write_text("hi\nPESEL %s\n" % self.PESEL)
+        for command in ("git -C lib add README.md && git add README.md && git commit -m x",
+                        "git -C lib commit -am y && git commit -am x",
+                        "(cd lib && git commit -am y) && git add README.md && git commit -m x"):
+            code, out, _ = self.commit(command)
+            self.assertDecision(out, "deny")
+            self.assertIn("README.md, line 2: PESEL", self.reason(out))
+
+    def test_directory_change_in_a_subshell_ends_with_it(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "b.txt").write_text("x\n")
+        self.commit_now("a.txt", "sub/b.txt")
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        (self.repo / "new.csv").write_text("1,%s\n" % self.PESEL)
+        for command, label in (("(cd sub && git status) && git add new.csv && git commit -m x", "new.csv"),
+                               ("(cd sub) && git commit -m x a.txt", "a.txt"),
+                               ("(cd sub && git diff) && git commit -m x a.txt", "a.txt"),
+                               ("bash -c 'cd sub' && git commit -m x a.txt", "a.txt"),
+                               ("sh -c 'cd sub && git status' && git commit -m x a.txt", "a.txt"),
+                               ("echo \"$(cd sub && pwd)\" && git commit -m x a.txt", "a.txt"),
+                               ("pushd sub && popd && git commit -m x a.txt", "a.txt"),
+                               ("{ cd sub; cd ..; } && git commit -m x a.txt", "a.txt"),
+                               ("cd sub && eval 'cd ..' && git commit -m x a.txt", "a.txt")):
+            code, out, _ = self.commit(command)
+            self.assertDecision(out, "deny")
+            self.assertIn(label, self.reason(out), command)
+
+    # Each of these may or may not leave the shell in sub/ when the commit runs; the hook does not
+    # decide which, it resolves the paths against every directory the command may change into.
+    UNCERTAIN_DIRECTORY_COMMANDS = (
+        "(cd sub; exit 0); git commit -m x a.txt",
+        "( (cd sub); git commit -m x a.txt )",
+        "x=$(cd sub; pwd); git commit -m x a.txt",
+        "false && cd sub; git commit -m x a.txt",
+        "true || cd sub; git commit -m x a.txt",
+        "[ -d nope ] && cd sub; git commit -m x a.txt",
+        "if false; then cd sub; fi; git commit -m x a.txt",
+        "while false; do cd sub; done; git commit -m x a.txt",
+        "case x in y) cd sub;; esac; git commit -m x a.txt",
+        "f() { cd sub; }; git commit -m x a.txt",
+        "cd sub & git commit -m x a.txt",
+        "cd sub | cat; git commit -m x a.txt",
+        "{ cd sub; } | cat; git commit -m x a.txt",
+        "cd sub && $(echo cd ..) && git commit -m x a.txt",
+    )
+
+    def uncertain_setup(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "b.txt").write_text("x\n")
+        self.commit_now("a.txt", "sub/b.txt")
+
+    def test_paths_are_resolved_in_every_directory_the_command_may_be_in(self):
+        self.uncertain_setup()
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        for command in self.UNCERTAIN_DIRECTORY_COMMANDS:
+            code, out, _ = self.commit(command)
+            self.assertEqual(code, 0, command)
+            self.assertIsNotNone(out, command)
+            self.assertDecision(out, "deny")
+            self.assertIn("a.txt, line 2: PESEL", self.reason(out), command)
+
+    def test_wider_resolution_does_not_report_unrelated_files(self):
+        self.uncertain_setup()
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        (self.repo / "sub" / "b.txt").write_text("x\ny\n")
+        self.assertEqual(self.commit("cd sub && git commit -m x b.txt")[:2], (0, None))
+
+    def test_operators_glued_to_a_parenthesis_are_split(self):
+        self.assertEqual(g._split_operators(");"), [")", ";"])
+        self.assertEqual(g._split_operators("))"), [")", ")"])
+        self.assertEqual(g._split_operators(")|"), [")", "|"])
+        self.assertEqual(g._split_operators(")&&"), [")", "&&"])
+        self.assertEqual(g._split_operators(">&"), [">&"])
+        p = g.parse_git_command("(cd sub; exit 0); git commit -m x a.txt", "/r")
+        self.assertEqual(p.path_specs[-1].cwd, "/r")
+
+    def test_directory_that_cannot_be_resolved_scans_everything_and_asks(self):
+        self.uncertain_setup()
+        (self.repo / "other.txt").write_text("clean\n")
+        self.commit_now("other.txt")
+        (self.repo / "other.txt").write_text("clean\nPESEL %s\n" % self.PESEL)
+        for command, env in (('cd "$D" && git commit -m x a.txt', None),
+                             ("cd sub && git commit -m x b.txt", {"CDPATH": "/"}),
+                             ("CDPATH=/ cd sub && git commit -m x b.txt", None)):
+            code, out, _ = self.run_hook("Bash", {"command": command}, env=env)
+            self.assertDecision(out, "deny")
+            reason = self.reason(out)
+            self.assertIn("other.txt, line 2: PESEL", reason, command)
+            self.assertIn("could not be resolved", reason, command)
+
+    def test_directory_scopes_in_the_parser(self):
+        for command, expected in (("(cd sub) && git commit -m x a.txt", "/r"),
+                                  ("bash -c 'cd sub' && git commit -m x a.txt", "/r"),
+                                  ("{ cd sub; } && git commit -m x a.txt", "/r/sub"),
+                                  ("eval 'cd sub' && git commit -m x a.txt", "/r/sub"),
+                                  ("pushd sub && popd && git commit -m x a.txt", "/r")):
+            p = g.parse_git_command(command, "/r")
+            self.assertEqual(p.path_specs[-1].cwd, expected, command)
+
+    def test_git_stage_is_git_add(self):
+        (self.repo / "new.csv").write_text("1,%s\n" % self.PESEL)
+        for command in ("git stage new.csv && git commit -m x", "git stage -A && git commit -m x"):
+            code, out, _ = self.commit(command)
+            self.assertEqual(code, 0)
+            self.assertDecision(out, "deny")
+            self.assertIn("new.csv (untracked, staged by git add), line 1: PESEL", self.reason(out))
+
+    def test_path_outside_the_repository_asks(self):
+        outside = Path(self.tmp.name) / "outside.txt"
+        outside.write_text("hello\n")
+        code, out, _ = self.commit("git add -- ../outside.txt && git commit -m x")
+        self.assertEqual(code, 0)
+        self.assertDecision(out, "ask")
+        self.assertIn("git could not", self.reason(out))
+
+    def test_here_document_body_never_hides_content(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        self.commit_now("a.txt")
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        code, out, _ = self.commit("git commit -F - <<'EOF' $FILE\nUpdate ${name}\nEOF")
+        self.assertDecision(out, "deny")
+        self.assertIn("a.txt, line 2: PESEL", self.reason(out))
+
+    @unittest.skipUnless(os.name == "posix", "needs a shell script as filter")
+    def test_clean_filter_is_not_run(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        (self.repo / "b.txt").write_text("other\n")
+        self.commit_now("a.txt", "b.txt")
+        marker = Path(self.tmp.name) / "filter-ran"
+        script = Path(self.tmp.name) / "filter.sh"
+        script.write_text("#!/bin/sh\ntouch %s\ncat\n" % marker)
+        script.chmod(0o755)
+        self.git("config", "filter.evil.clean", str(script))
+        self.git("config", "filter.evil.process", str(script))
+        (self.repo / ".git" / "info").mkdir(exist_ok=True)
+        (self.repo / ".git" / "info" / "attributes").write_text("*.txt filter=evil\n")
+        (self.repo / "a.txt").write_text("hello\nPESEL %s\n" % self.PESEL)
+        (self.repo / "b.txt").write_text("other\nmore\n")
+        for command in ("git commit -m x a.txt", "git commit -am x", "git add a.txt b.txt && git commit -m x"):
+            code, out, _ = self.commit(command)
+            self.assertDecision(out, "deny")
+            reason = self.reason(out)
+            self.assertIn("a.txt, line 2: PESEL", reason)
+            self.assertNotIn("b.txt", reason)
+            self.assertFalse(marker.exists(), "a configured filter was run: " + command)
+
+    def test_unchanged_tracked_files_are_not_reported(self):
+        (self.repo / "a.txt").write_text("PESEL %s\nhello\n" % self.PESEL)
+        (self.repo / "b.txt").write_text("hello\n")
+        self.commit_now("a.txt", "b.txt")
+        # a.txt only gets a new line ending style; b.txt gets a clean new line.
+        (self.repo / "a.txt").write_bytes(("PESEL %s\r\nhello\r\n" % self.PESEL).encode())
+        (self.repo / "b.txt").write_text("hello\nworld\n")
+        self.assertEqual(self.commit("git commit -am x")[:2], (0, None))
+
+
 class TestContentThatIsNotScanned(HookCase):
     """Binary files are skipped with a visible note; unreadable files ask instead of passing."""
 

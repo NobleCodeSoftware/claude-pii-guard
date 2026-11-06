@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-11-06
+
+### Fixed
+
+- Content that a command line commits from outside the index was not scanned, so these commits
+  passed without a finding or a prompt:
+  - `git add PATHS && git commit`: untracked files under the given paths (only `-A`, `--all`, `.`,
+    `*` and `:/` were covered before). They are now listed with
+    `git ls-files --others --exclude-standard` (without `--exclude-standard` for `git add -f`) and
+    scanned. Unstaged changes to tracked files are scanned only under the given paths.
+  - `git commit PATHS` (also with `-i`/`--include` or `-o`/`--only`): the working-tree version of
+    the given paths is committed, but only the staged diff was read. The unstaged changes under
+    those paths are now scanned.
+  - `git stage`, the built-in synonym of `git add`, was not recognised at all: `git stage PATHS`
+    and `git stage -A` before `git commit` are now handled exactly like `git add`.
+- `git add -f -A` and `git add -f .` now also scan ignored files, which git adds in that case.
+- Unstaged changes are no longer read with `git diff` against the working tree, which runs the
+  clean filters (`filter.<driver>.clean` and `.process`) named in a repository's git config and
+  `.gitattributes`, so such a program could run before the user approved the command. The hook now
+  lists the index with `git ls-files -s`, reads changed working-tree files itself and compares them
+  line by line with the staged blob from `git cat-file blob`, which runs no filter.
+- A `cd` that may not take effect (inside a subshell, `bash -c '...'`, a condition, a loop, a
+  `case` branch, a function that is not called, a pipeline or a background job) was always
+  followed, so later `git add` and `git commit` paths could be resolved in the wrong directory and
+  nothing was scanned. Relative paths are now resolved against every directory the command may
+  change into: the starting directory and every existing directory reachable through any `cd`,
+  `pushd` or `git -C` in the command line. The scan can be wider than what git will add, never
+  narrower. A directory that cannot be resolved (an expansion, `cd -`, a `popd` without `pushd`, a
+  directory that does not exist yet, `CDPATH` set for a relative `cd`) makes the whole of every
+  repository involved count, and the user is asked.
+- The tokenizer returned `);`, `)|`, `)&` and `))` as single words, so they did not end a
+  subshell or a command. Runs of shell punctuation are now split into separate operators.
+- With several `git commit` commands in one command line, only the staged diff of the first one's
+  repository was scanned. The staged diff of every repository found as above is now scanned.
+- Arguments of `git add` and `git commit` that follow a message split again as a command line (for
+  example `git commit -m "$(cat <<'EOF' ... EOF)" PATHS`) are now read as arguments of that command.
+
+### Changed
+
+- The arguments of `git add` and `git commit` are classified as options, option values and
+  pathspecs. When they cannot be classified (a path with a variable, a command substitution, a brace
+  expansion or `~`, an unknown option, `--pathspec-from-file`, arguments supplied by `xargs` or
+  `parallel`, a directory that does not exist yet), the unstaged changes and untracked files of the
+  whole repository are scanned and the user is asked. After a here-document operator, where the
+  document's body cannot be told from arguments, such a word makes the whole repository count
+  without a prompt.
+- New git calls use the same hardening as the existing ones (no shell, fixed argument list, paths
+  after `--`, external diff, textconv and fsmonitor disabled, `GIT_OPTIONAL_LOCKS=0`, the shared
+  deadline). A line of the working-tree file that also appears in the staged version is not reported
+  again, and a change of line endings alone adds nothing. Every git call also sets
+  `diff.relative=false`, so diff paths are relative to the top of the work tree when git runs in a
+  subdirectory.
+- An untracked file whose real path is outside the repository (a symbolic link pointing out of it)
+  is not read; the link text, which is what git commits, is scanned instead.
+- A changed tracked file larger than `max_scan_bytes` is reported as not scanned without being
+  hashed or read, so it cannot use up the time budget.
+- Description in `plugin.json`, `marketplace.json` and the README: "Catches common personal data
+  before Claude Code writes or commits it." instead of "Stops Claude Code from writing or committing
+  personal data.", which overstated what a pattern-based hook can do.
+- README: "What is scanned" lists exactly which working-tree content `git add` and `git commit` are
+  scanned for; "Limitations" replaces the claim that the next commit is checked again (content that
+  is already committed is not scanned again) with a list of what is not scanned.
+- `SECURITY.md`: "Security design" says exactly which git calls are made and that no configured
+  diff program, textconv driver, fsmonitor hook or clean filter runs; the last item under "Guidance
+  for users" says how reports are handled.
+
 ## [0.1.3] - 2026-10-23
 
 ### Changed

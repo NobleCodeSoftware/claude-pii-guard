@@ -1,15 +1,15 @@
 # pii-guard for Claude Code
 
-Stops Claude Code from writing or committing personal data. A local PreToolUse hook that detects
-emails, phone numbers, PESEL, IBAN and Luhn-valid card numbers, plus your own private phrases kept
-outside the repo, in block, ask or warn mode. No network access. Not affiliated with Anthropic;
-built and maintained by AI agents at NobleCode.
+Catches common personal data before Claude Code writes or commits it. A local PreToolUse hook that
+detects emails, phone numbers, PESEL, IBAN and Luhn-valid card numbers, plus your own private
+phrases kept outside the repo, in block, ask or warn mode. No network access. Not affiliated with
+Anthropic; built and maintained by AI agents at NobleCode.
 
 The hook checks what Claude is about to write (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) or
 commit (`git commit` from `Bash` or `PowerShell`). If it finds personal data, it blocks the call (or
 warns, or asks you, as you prefer) and tells Claude where the value is, masked.
 
-> Status: early release (v0.1.3). A single Python file using only the standard library, plus tests.
+> Status: early release (v0.1.4). A single Python file using only the standard library, plus tests.
 > Read "Limitations" before you rely on it.
 
 ## The problem
@@ -19,8 +19,9 @@ spreadsheet, your own git config. That data then ends up in fixtures, docs, exam
 messages, and from there in a public repository. It is easy to do by accident and hard to undo once
 pushed.
 
-Review catches most of it, but review is the last line. pii-guard adds an earlier one: the write or
-commit does not happen until the data is replaced with synthetic values or explicitly allowed.
+Review catches most of it, but review is the last line. pii-guard adds an earlier one: a write or
+commit in which it finds such data does not happen until the data is replaced with synthetic values
+or explicitly allowed.
 
 ## Install (2 commands, plus optional configuration)
 
@@ -78,15 +79,47 @@ these false-positive cases.
 - `Edit` and `MultiEdit`: the new text only. A value that was already in the replaced text is not
   reported again, so you can edit near existing data without noise. Line numbers refer to the file.
 - `git commit`: the staged diff (added lines only), the commit command with its `-m` messages, and
-  `-F` message files. With `git commit -a`, or `git add` in the same command, unstaged changes are
-  scanned too; with `git add -A` or `git add .` also untracked files. Commit trailers such as
-  `Signed-off-by:` are allowed (switch off with `"allow_trailers": false`).
+  `-F` message files. Commit trailers such as `Signed-off-by:` are allowed (switch off with
+  `"allow_trailers": false`).
+- Working-tree content that `git add` (or its synonym `git stage`) or `git commit` in the same
+  command line takes into the commit, read from the working tree before the command runs:
+  - `git add PATHS`: unstaged changes to tracked files and untracked files under those paths
+    (ignored files only with `-f`/`--force`); with `-u`, tracked files only;
+  - `git add -A` (or `-i`) without paths: the same for the whole repository; `git add -u`, `-p` or
+    `-e` without paths: all unstaged changes to tracked files. `.` and `:/` are paths like any
+    other; a glob such as `*` or `*.csv` is passed to git, which matches it recursively, so it can
+    cover more than the shell would add;
+  - `git commit -a`: all unstaged changes to tracked files; `git commit PATHS` (also with `-i` or
+    `-o`): unstaged changes under those paths.
+
+  Paths are passed to git exactly as written, after `--`. The hook does not decide which `cd` in a
+  command line really runs (one inside a condition, a function, a pipeline, a background job or a
+  subshell may or may not), so relative paths are resolved against every directory the command
+  may change into: the starting directory and every existing directory reachable through any
+  `cd`, `pushd` or `git -C` in the command line. The scan can therefore be wider than what git will
+  add. Each repository found this way also has its staged diff scanned. Arguments are told apart
+  from the
+  values of options such as `-m`, `-F`, `-C`, `-c`, `-t`, `--author`, `--date`, `--fixup`,
+  `--squash`, `--cleanup` and `--trailer`. When the hook cannot tell which files an argument list
+  takes, the unstaged changes and untracked files of the whole repository are scanned and you are
+  asked (see below). After a here-document operator (`<<EOF`) the hook cannot tell the document's
+  body from arguments, so a word there that it cannot classify makes the whole repository count,
+  without a prompt.
+
+  Unstaged changes are found without `git diff`, which would run the clean filters
+  (`filter.<driver>.clean` or `.process`) named in the repository's git config and
+  `.gitattributes`. The index is listed with `git ls-files -s`; a tracked file whose stat data or
+  content hash differs from its index entry is read directly and compared, line by line, with the
+  staged blob (`git cat-file blob`). Lines that are not in the staged version are scanned, as they
+  are in the working tree: no filter output is scanned, and a change of line endings alone adds
+  nothing.
 
 How a commit is found in a shell command:
 
 - The command is split into shell words, line continuations are joined, and global git options
-  (`-C`, `-c`, `--no-pager` and others) are skipped with their values. `cd`, `pushd` and `-C` are
-  followed to the repository.
+  (`-C`, `-c`, `--no-pager` and others) are skipped with their values. `cd`, `pushd`, `popd` and
+  `-C` are followed to the repository, and the paths of `git add` and `git commit` are resolved
+  in every directory the command may change into (see above).
 - A command line passed to another program is split again and checked the same way: a shell with
   `-c` or a here-string, `eval`, PowerShell `-Command`, command substitution, `find -exec`,
   `env -S`, `su -c`, `busybox`, and git subcommands that run commands (`submodule foreach`,
@@ -108,9 +141,10 @@ get the permission prompt, in `warn` mode a warning:
 
 - anything beyond `max_scan_bytes`;
 - a commit message file (`-F`) that is not a readable regular text file;
-- an untracked file under `git add -A` that cannot be read (no permission, a dangling symlink, a
+- an untracked file taken by `git add` that cannot be read (no permission, a dangling symlink, a
   FIFO or device);
-- a diff or file list that git could not produce, or a file without a text diff whose content could
+- a diff or file list that git could not produce (for example for a path outside the repository),
+  or a file without a text diff whose content could
   not be read;
 - anything left when the time budget runs out (see below).
 
@@ -125,25 +159,31 @@ In these cases the commit is scanned as well as possible and you are asked too:
   data, text written to a script-like file);
 - the command defines a git alias (`-c alias.<name>=...`);
 - a `cd`, `pushd` or `-C` directory cannot be resolved (it does not exist yet, or uses a variable,
-  a glob, `~user` or `cd -`);
+  a glob, `~user` or `cd -`), a `popd` has no matching `pushd`, or `CDPATH` is set (in the
+  environment or in the command) for a relative `cd`. The unstaged changes and untracked files of
+  every repository involved are then scanned too;
 - the command points git at another repository, work tree or index (the `GIT_DIR`,
   `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` or `GIT_COMMON_DIR` variables,
-  `--git-dir`, `--work-tree`).
+  `--git-dir`, `--work-tree`);
+- the hook cannot tell which files `git add` or `git commit` takes: a path with a variable, a
+  command substitution, a brace expansion or `~`; an option it does not know; paths read from a file
+  (`--pathspec-from-file`) or supplied by `xargs` or `parallel`; a `git add` directory that does not
+  exist yet.
 
 When git shows no text diff for a file (because it is binary, or because `.gitattributes` marks it
-`-diff` or `binary`), pii-guard reads the content that will be committed: the staged blob
-(`git cat-file`) for the staged diff, the working-tree file for the unstaged diff. If that content
-is text, the whole file is scanned. Binary files are not scanned for personal data: a file counts as
-binary when it has a NUL byte in its first 8 KB. When a commit stages one (in the staged or unstaged
-diff, or untracked under `git add -A`), it is listed in a visible note ("binary files skipped, not
+`-diff` or `binary`), pii-guard reads the content that will be committed: the staged blob (`git
+cat-file`) for the staged diff. If that content is text, the whole file is scanned. Binary files are
+not scanned for personal data: a file counts as binary when it has a NUL byte in its first 8 KB.
+When a commit stages one (in the staged diff, as a changed tracked file in the working tree, or
+untracked and taken by `git add`), it is listed in a visible note ("binary files skipped, not
 scanned for personal data: ..."), and the decision is not changed by it.
 
 Time budget: one hook run has a single 8-second deadline, shared by every `git` call (`rev-parse`,
-the staged diff, the unstaged diff, the untracked file list, and two `cat-file` calls per staged
-file without a text diff), every file read and the scan itself. Each `git` call gets only the time
-that is left and is stopped at the deadline. Whatever is not done by then counts as not scanned, as
-above. This keeps the hook, including Python start-up, below its 15-second timeout in
-`hooks/hooks.json`.
+the staged diff, the index listings, the untracked file lists, two `cat-file` calls per staged file
+without a text diff, and one per changed tracked file in the working tree), every file read and the
+scan itself. Each `git` call gets only the time that is left and is stopped at the deadline.
+Whatever is not done by then counts as not scanned, as above. This keeps the hook, including Python
+start-up, below its 15-second timeout in `hooks/hooks.json`.
 
 The scan stops after 50 findings, since one is enough for a decision; the message then says
 "50 or more findings".
@@ -271,9 +311,21 @@ python3 scripts/pii_guard.py scan path/to/file ...
   shell, an interpreter, a program given by path such as `./build.sh` or `/usr/bin/git`), every
   quoted `git commit` in a text tool's arguments is treated as a commit, for example
   `grep "git commit" README.md && bash build.sh`.
-- **Commit scanning is best effort.** It reads the staged state when the hook runs. Complex shell
-  constructs (aliases, scripts that call `git commit`, `git add` of specific paths) may be scanned
-  less precisely; the next commit is checked again.
+- **Commit scanning sees the repository as it is before the command runs.** The hook runs once,
+  before the whole shell command, and scans the staged diff and the working-tree content described
+  in "What is scanned". It does not see:
+  - content that another command in the same line creates or changes before `git add` or
+    `git commit` runs, for example a file written by a script, a redirection or `cp`, or content
+    staged by `git apply --cached`, `git checkout ... -- PATH`, `git stash pop` or
+    `git update-index` between the hook and the commit;
+  - content that is already committed. `git commit --amend` keeps the content and, with
+    `--no-edit`, the message of the commit it replaces without scanning them again, and `-C`,
+    `-c`, `--fixup` and `--squash` reuse text from an existing commit. A value that slipped into
+    an earlier commit is not reported by later commits; it stays in the history until the history
+    is rewritten;
+  - files inside a nested repository or submodule;
+  - commits made by shell aliases, shell functions, git aliases from your git config or scripts
+    (see above).
 - **Masked output still hints at the value.** An e-mail address keeps the first character of the
   local part and of the domain, and the top-level domain; a PESEL keeps its last two digits; phone,
   IBAN and card numbers keep their first two and last two characters (only the first character

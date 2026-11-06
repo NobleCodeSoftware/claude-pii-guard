@@ -9,7 +9,7 @@
     {
       "name": "pii-guard",
       "source": ".",
-      "description": "Stops Claude Code from writing or committing personal data (e-mail, phone, PESEL, IBAN, cards, private phrases).",
+      "description": "Catches common personal data before Claude Code writes or commits it (e-mail, phone, PESEL, IBAN, cards, private phrases).",
       "category": "security",
       "tags": ["privacy", "pii", "hooks"]
     }

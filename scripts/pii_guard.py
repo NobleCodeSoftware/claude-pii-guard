@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""pii-guard: a Claude Code PreToolUse hook that stops personal data before it is written or committed.
+"""pii-guard: a Claude Code PreToolUse hook that catches common personal data before it is written
+or committed.
 
 Standard library only. The hook reads the PreToolUse JSON from stdin, scans the text that a tool call
 is about to write (Write, Edit, MultiEdit, NotebookEdit) or commit (Bash or PowerShell running
@@ -25,7 +26,9 @@ scanned.
 """
 
 import bisect
+import collections
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -35,7 +38,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 # Shared deadline for one hook run, in seconds. Keep it well below the "timeout" in hooks/hooks.json
 # (15 s), which also has to cover starting Python.
@@ -641,22 +644,25 @@ def touches_guard_config(path):
 _GIT = r"(?:^|[\s;&|(`'\"\\/=])git(?:\.exe)?['\"]?"
 _GIT_OPTS = r"(?:\s+(?:-C\s+\S+|-c\s+\S+|--[\w-]+(?:=\S+)?|-[A-Za-z]))*"
 GIT_COMMIT_RE = re.compile(_GIT + _GIT_OPTS + r"\s+['\"]?commit(?![\w-])")
-GIT_ADD_RE = re.compile(_GIT + _GIT_OPTS + r"\s+['\"]?add(?![\w-])([^;&|\n'\"]*)")
+# `git stage` is a built-in synonym of `git add`.
+GIT_ADD_RE = re.compile(_GIT + _GIT_OPTS + r"\s+['\"]?(?:add|stage)(?![\w-])([^;&|\n'\"]*)")
+ADD_SUBCOMMANDS = ("add", "stage")
 
 
-# Loose tests for text that looks like `git ... commit` or `git ... add` with both as separate words.
+# Loose tests for text that looks like `git ... commit` or `git ... add` (or `stage`) with both as
+# separate words.
 # They are used whenever the token parser did not find that subcommand; the words in between must not
 # include another git subcommand, so `git log --grep commit` or `git help commit` do not count.
 GIT_LOOSE_RES = {
-    sub: re.compile(r"(?<![\w.-])git(?:\.exe)?(?![\w.-])([^;&|\n]*?)(?<![\w.-])%s(?![\w-])" % sub)
-    for sub in ("commit", "add")
+    sub: re.compile(r"(?<![\w.-])git(?:\.exe)?(?![\w.-])([^;&|\n]*?)(?<![\w.-])%s(?![\w-])" % words)
+    for sub, words in (("commit", "commit"), ("add", "(?:add|stage)"))
 }
 OTHER_GIT_SUBCOMMANDS = {
     "log", "show", "grep", "status", "diff", "help", "blame", "branch", "checkout", "switch", "stash",
     "notes", "tag", "reset", "restore", "revert", "cherry-pick", "rebase", "merge", "pull", "push",
     "fetch", "clone", "init", "config", "rev-list", "rev-parse", "shortlog", "describe", "reflog",
     "bisect", "worktree", "submodule", "remote", "ls-files", "rm", "mv", "clean", "format-patch",
-    "am", "apply", "commit", "add",
+    "am", "apply", "commit", "add", "stage",
 }
 # Global git options that take their value as the next argument.
 GIT_VALUE_OPTIONS = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
@@ -670,6 +676,7 @@ GIT_REDIRECT_ENV_RE = re.compile(r"(?:^|:)(?:GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FIL
 GIT_ALIAS_RE = re.compile(r"(?i)(?:^|\s)(?:-c\s*|--config-env[=\s]+)['\"]?alias\.|GIT_CONFIG_(?:PARAMETERS|COUNT)=")
 SHELL_SEPARATORS = ("&&", "||", ";", "|", "&", "(", ")", ";;", "|&")
 DIRECTORY_COMMANDS = ("cd", "pushd")
+CD_OPTIONS = ("-L", "-P", "-e", "-@", "-n", "--")
 ADD_ALL_ARGS = ("-A", "--all", ".", "*", ":/")
 # A directory name the hook cannot resolve without a shell: expansions, globs and `~user`.
 SHELL_EXPANSION_RE = re.compile(r"[$`*?\[{]|^~[^/]")
@@ -727,6 +734,210 @@ class GitCommand(object):
         self.obfuscated = False     # git or its subcommand comes from a variable or ANSI-C quoting
         self.indirect = False       # a quoted `git commit` run by a program the hook does not parse
         self.unresolved_dir = None  # a cd, pushd or -C directory the hook cannot follow
+        self.path_specs = []        # PathSpec for each `git add` and each `git commit`, in order
+        self.dir_values = []        # every cd, pushd and git -C value, as ("cd" or "-C", value)
+        self.dirs = [cwd]           # every directory the command may be in (see _candidate_dirs)
+
+
+class PathSpec(object):
+    """Working-tree content that one `git add` or `git commit` takes from outside the index.
+
+    `tracked` and `untracked` are None (nothing), [] (the whole repository) or a list of pathspecs,
+    which git resolves relative to `cwd`. `force` is `git add -f`: ignored files are added too.
+    `problem` is set when the arguments could not be classified; the hook then scans the whole
+    repository and asks the user."""
+
+    def __init__(self, command, cwd, tracked=None, untracked=None, force=False, problem=None):
+        self.command, self.cwd = command, cwd
+        self.tracked, self.untracked, self.force, self.problem = tracked, untracked, force, problem
+
+
+# Options of `git add` and `git commit`: "flag" takes no value, "value" takes one (attached or as the
+# next argument), "optional" takes one only when attached (`-uno`, `--gpg-sign=KEY`).
+GIT_ADD_OPTIONS = {
+    "dry-run": "flag", "verbose": "flag", "force": "flag", "interactive": "flag", "patch": "flag",
+    "edit": "flag", "update": "flag", "all": "flag", "ignore-removal": "flag", "intent-to-add": "flag",
+    "refresh": "flag", "ignore-errors": "flag", "ignore-missing": "flag", "sparse": "flag",
+    "renormalize": "flag", "warn-embedded-repo": "flag", "pathspec-file-nul": "flag",
+    "chmod": "value", "pathspec-from-file": "value",
+}
+GIT_ADD_SHORT = {"n": "dry-run", "v": "verbose", "f": "force", "i": "interactive", "p": "patch",
+                 "e": "edit", "u": "update", "A": "all", "N": "intent-to-add"}
+GIT_COMMIT_OPTIONS = {
+    "all": "flag", "patch": "flag", "interactive": "flag", "reset-author": "flag", "short": "flag",
+    "branch": "flag", "porcelain": "flag", "long": "flag", "null": "flag", "signoff": "flag",
+    "verify": "flag", "allow-empty": "flag", "allow-empty-message": "flag", "edit": "flag",
+    "amend": "flag", "post-rewrite": "flag", "include": "flag", "only": "flag", "verbose": "flag",
+    "quiet": "flag", "dry-run": "flag", "status": "flag", "ahead-behind": "flag",
+    "pathspec-file-nul": "flag",
+    "message": "value", "file": "value", "reuse-message": "value", "reedit-message": "value",
+    "fixup": "value", "squash": "value", "author": "value", "date": "value", "template": "value",
+    "cleanup": "value", "trailer": "value", "pathspec-from-file": "value",
+    "untracked-files": "optional", "gpg-sign": "optional",
+}
+GIT_COMMIT_SHORT = {"a": "all", "p": "patch", "s": "signoff", "n": "no-verify", "e": "edit",
+                    "i": "include", "o": "only", "v": "verbose", "q": "quiet", "z": "null",
+                    "m": "message", "F": "file", "C": "reuse-message", "c": "reedit-message",
+                    "t": "template", "u": "untracked-files", "S": "gpg-sign"}
+# A pathspec the hook cannot know without a shell: parameter or command expansion, brace expansion,
+# `~` (and `{}` from find -exec).
+UNKNOWN_PATHSPEC_RE = re.compile(r"[$`{}]|^~")
+# Shell redirection operators as the tokenizer returns them (`>`, `2>&1` becomes 2, >&, 1).
+REDIRECTION_RE = re.compile(r"^[<>&|]+$")
+# Programs that run git with arguments read from their input, which the hook cannot see.
+ARGUMENT_FEEDERS = {"xargs", "parallel"}
+
+
+def _long_option(name, options):
+    """The canonical name of a long option (git accepts unique abbreviations and `no-` forms),
+    with its kind, or (None, None) when it is unknown or ambiguous."""
+    names = {}
+    for opt, kind in options.items():
+        names.setdefault("no-" + opt, "flag")  # the negated form never takes a value
+        names[opt] = kind
+    if name in names:
+        return name, names[name]
+    matches = [n for n in names if n.startswith(name)]
+    if len(matches) == 1:
+        return matches[0], names[matches[0]]
+    return None, None
+
+
+def _classify_args(args, options, shorts):
+    """Split the arguments of `git add` or `git commit` into options and pathspecs.
+
+    Return (options seen, pathspecs, problem); `problem` names an argument the hook cannot classify
+    (an unknown option, an expansion in a pathspec, a pathspec list read from a file).
+
+    The tokenizer does not keep line ends, so the words after a here-document operator (`<<EOF`) may
+    be its body or real arguments on the same line. They are classified like other arguments, except
+    that a word that cannot be classified is not reported: an unknown option there is skipped (git
+    refuses a real one and adds or commits nothing), and an unknown pathspec makes the whole
+    repository count (`:/`), so the result covers at least what git takes, without a prompt for
+    every `$` in a message body."""
+    seen, paths, i, n, heredoc = set(), [], 0, len(args), False
+
+    def unknown_path(p):
+        if heredoc:
+            if ":/" not in paths:
+                paths.append(":/")
+            return None
+        return "pathspec %r" % p
+
+    while i < n:
+        a = args[i]
+        if a in ("<<", "<<-"):
+            heredoc = True
+        if a == "--":
+            for p in args[i + 1:]:
+                if UNKNOWN_PATHSPEC_RE.search(p):
+                    problem = unknown_path(p)
+                    if problem:
+                        return seen, paths, problem
+                else:
+                    paths.append(p)
+            break
+        if REDIRECTION_RE.match(a):
+            i += 2  # the operator and its target (or here-document delimiter)
+            continue
+        if a.isdigit() and i + 1 < n and REDIRECTION_RE.match(args[i + 1]):
+            i += 1  # file descriptor number of a redirection
+            continue
+        if a.startswith("--"):
+            name, eq, _value = a[2:].partition("=")
+            canon, kind = _long_option(name, options)
+            if canon is None:
+                if heredoc:
+                    i += 1
+                    continue
+                return seen, paths, "option %s" % a
+            seen.add(canon)
+            i += 2 if kind == "value" and not eq else 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            j, step, opts = 1, 1, set()
+            while j < len(a):
+                canon = shorts.get(a[j])
+                if canon is None:
+                    break
+                opts.add(canon)
+                kind = options.get(canon, "flag")
+                if kind == "value":
+                    step = 1 if j + 1 < len(a) else 2  # value attached, or the next argument
+                    break
+                if kind == "optional":
+                    break  # the rest of the word is its value
+                j += 1
+            if j < len(a) and shorts.get(a[j]) is None:
+                if heredoc:
+                    i += 1
+                    continue
+                return seen, paths, "option -%s" % a[j]
+            seen |= opts
+            i += step
+            continue
+        if UNKNOWN_PATHSPEC_RE.search(a):
+            problem = unknown_path(a)
+            if problem:
+                return seen, paths, problem
+            i += 1
+            continue
+        paths.append(a)
+        i += 1
+    if "pathspec-from-file" in seen:
+        return seen, paths, "--pathspec-from-file"
+    return seen, paths, None
+
+
+def _add_spec(args, cwd, name="add"):
+    seen, paths, problem = _classify_args(args, GIT_ADD_OPTIONS, GIT_ADD_SHORT)
+    spec = PathSpec("git " + name, cwd, force="force" in seen, problem=problem)
+    if paths:
+        spec.tracked = paths
+        if "update" not in seen:
+            spec.untracked = paths
+    else:
+        # Without pathspecs, -A and -i work on the whole tree, -u, -p and -e on tracked files.
+        if seen & {"all", "update", "patch", "edit", "interactive"}:
+            spec.tracked = []
+        if seen & {"all", "interactive"}:
+            spec.untracked = []
+    return spec
+
+
+def _commit_spec(args, cwd):
+    """`git commit PATHS` (also with -i or -o) commits the working-tree version of PATHS."""
+    seen, paths, problem = _classify_args(args, GIT_COMMIT_OPTIONS, GIT_COMMIT_SHORT)
+    spec = PathSpec("git commit", cwd, problem=problem)
+    if seen & {"all", "patch", "interactive"}:
+        spec.tracked = []
+    elif paths:
+        spec.tracked = paths
+    return spec
+
+
+def _fed_arguments(tokens, i):
+    """True when the git at token i is run by xargs or parallel, which append arguments."""
+    k = i - 1
+    while k >= 0 and tokens[k] not in SHELL_SEPARATORS:
+        if _program(tokens[k]) in ARGUMENT_FEEDERS:
+            return True
+        k -= 1
+    return False
+
+
+def _group_end(tokens, k):
+    """Index of the _GroupEnd that closes the _GroupStart at k."""
+    depth = 0
+    while k < len(tokens):
+        if isinstance(tokens[k], _GroupStart):
+            depth += 1
+        elif isinstance(tokens[k], _GroupEnd):
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return len(tokens) - 1
 
 
 def _change_dir(current, value, result):
@@ -735,6 +946,50 @@ def _change_dir(current, value, result):
         result.unresolved_dir = result.unresolved_dir or (value or "(none)")
         return current
     return os.path.join(current, os.path.expanduser(value))
+
+
+MAX_CANDIDATE_DIRS = 32
+
+
+def _candidate_dirs(cwd, values, result, command):
+    """Every directory the command may be in when a git command runs, as a union.
+
+    The hook does not decide which `cd` really runs: one inside a condition, a function, a
+    pipeline, a background job or a subshell may or may not affect a later command. So the start
+    directory and every existing directory that any cd, pushd or git -C value in the command line
+    leads to, from any directory already in the set, are all candidates (repeated until nothing new
+    is added). Relative pathspecs are resolved against each of them, which can scan more than git
+    will add, never less. A value that cannot be resolved (an expansion, `cd -`, a directory that does
+    not exist yet, `CDPATH`) sets `unresolved_dir`; the hook then scans whole repositories and asks."""
+    dirs = [os.path.normpath(cwd)]
+    cdpath = bool(os.environ.get("CDPATH")) or bool(re.search(r"(?:^|[\s;&|(])(?:export\s+)?CDPATH=", command))
+    pending = []
+    for kind, value in values:
+        if value.startswith("-") or SHELL_EXPANSION_RE.search(value):
+            result.unresolved_dir = result.unresolved_dir or value
+            continue
+        if kind == "cd" and cdpath and not value.startswith((".", "/", "~")):
+            result.unresolved_dir = result.unresolved_dir or "%s (CDPATH is set)" % value
+        pending.append(os.path.expanduser(value))
+    resolved = set()
+    changed = True
+    while changed:
+        changed = False
+        for value in pending:
+            for d in list(dirs):
+                cand = os.path.normpath(os.path.join(d, value))
+                if os.path.isdir(cand):
+                    resolved.add(value)
+                    if cand not in dirs:
+                        if len(dirs) >= MAX_CANDIDATE_DIRS:
+                            result.unresolved_dir = result.unresolved_dir or "(too many directories)"
+                            return dirs
+                        dirs.append(cand)
+                        changed = True
+    for value in pending:
+        if value not in resolved:
+            result.unresolved_dir = result.unresolved_dir or value
+    return dirs
 
 
 def _expansion_is_command(tokens, i):
@@ -769,9 +1024,35 @@ def parse_git_command(command, cwd):
     target, found_commit, moved = cwd, False, False
     cmds = _command_words(tokens)
     mentions_git = bool(GIT_WORD_RE.search(command))
+    consumed = set()  # argument tokens of a git command that follow an argument split again
+    # A directory change inside a subshell, `( ... )` or `$( ... )`, or inside a command line run by
+    # another program (`bash -c '...'`) ends with it; `{ ...; }` and `eval` run in the current shell.
+    scopes, dir_stack = [], []
     i = 0
     while i < len(tokens):
+        if i in consumed:
+            i += 1
+            continue
         tok = tokens[i]
+        if isinstance(tok, _GroupStart) or (tok == "(" and not isinstance(tok, _GroupEnd)):
+            scopes.append((target, moved, tok == "(" or tok.subshell))
+            i += 1
+            continue
+        if isinstance(tok, _GroupEnd) or tok == ")":
+            if scopes:
+                saved_target, saved_moved, subshell = scopes.pop()
+                if subshell:
+                    target, moved = saved_target, saved_moved
+            i += 1
+            continue
+        if tok == "popd":
+            if dir_stack:
+                target = dir_stack.pop()
+            else:
+                result.unresolved_dir = result.unresolved_dir or "(popd)"
+            moved = True
+            i += 1
+            continue
         if GIT_REDIRECT_ENV_RE.search(tok):
             result.redirected = True
         # A variable, command substitution or ANSI-C string as the command word can hide git.
@@ -779,7 +1060,13 @@ def parse_git_command(command, cwd):
                 and (mentions_git or ANSI_C_ESCAPE_RE.search(command))):
             result.obfuscated = True
         if tok in DIRECTORY_COMMANDS:
+            while i + 2 < len(tokens) and tokens[i + 1] in CD_OPTIONS and tokens[i + 2] not in SHELL_SEPARATORS:
+                i += 1  # `cd -P DIR`, `cd -- DIR`: the options do not change which directory it is
             value = tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1] not in SHELL_SEPARATORS else None
+            if tok == "pushd":
+                dir_stack.append(target)
+            if value is not None:
+                result.dir_values.append(("cd", value))
             target, moved = _change_dir(target, value, result), True
             i += 2 if value is not None else 1
             continue
@@ -794,6 +1081,7 @@ def parse_git_command(command, cwd):
                 result.redirected = True
             if opt in GIT_VALUE_OPTIONS and j + 1 < len(tokens):
                 if opt == "-C":
+                    result.dir_values.append(("-C", tokens[j + 1]))
                     local, local_moved = _change_dir(local, tokens[j + 1], result), True
                 elif opt in ("-c", "--config-env") and tokens[j + 1].lower().startswith("alias."):
                     result.alias = True
@@ -804,12 +1092,25 @@ def parse_git_command(command, cwd):
                 j += 1
         if j >= len(tokens):
             break
-        sub, k, args = tokens[j].strip(), j + 1, []
-        while k < len(tokens) and tokens[k] not in SHELL_SEPARATORS and not _is_git(tokens[k]):
+        # Arguments run up to the next shell separator. An argument that _split split again (a
+        # message such as "$(cat <<EOF ...)") is taken as its original text; the tokens inside it are
+        # still visited by this loop, the arguments after it are not.
+        sub, k, args, inner = tokens[j].strip(), j + 1, [], None
+        while k < len(tokens) and not _is_git(tokens[k]):
+            if isinstance(tokens[k], _GroupStart):
+                args.append(tokens[k].original)
+                inner = k if inner is None else inner
+                k = _group_end(tokens, k) + 1
+                continue
+            if tokens[k] in SHELL_SEPARATORS:
+                break
             args.append(tokens[k])
+            if inner is not None:
+                consumed.add(k)
             k += 1
         if sub.startswith("$") or "`" in sub or "$(" in sub:
             result.obfuscated = True  # the subcommand is a variable, substitution or ANSI-C string
+        fed = _fed_arguments(tokens, i)
         if sub == "commit":
             result.commit = True
             if not found_commit:
@@ -818,24 +1119,35 @@ def parse_git_command(command, cwd):
                     result.unresolved_dir = result.unresolved_dir or local
             if any(a == "--all" or re.match(r"^-[A-Za-z]*a[A-Za-z]*$", a) for a in args):
                 result.commit_all = True
-        elif sub == "add":
+            spec = _commit_spec(args, local)
+            if fed:
+                spec.problem = "arguments supplied by xargs or parallel"
+            if spec.tracked == []:
+                result.commit_all = True
+            result.path_specs.append(spec)
+        elif sub in ADD_SUBCOMMANDS:
             result.add = True
             if any(a in ADD_ALL_ARGS for a in args):
                 result.add_all = True
+            spec = _add_spec(args, local, sub)
+            if fed:
+                spec.problem = "arguments supplied by xargs or parallel"
+            result.path_specs.append(spec)
         elif sub not in OTHER_GIT_SUBCOMMANDS:
             # An unknown option or value before the subcommand: `git --frobnicate value commit`.
             for a in args:
-                if a in ("commit", "add"):
+                if a in ("commit",) + ADD_SUBCOMMANDS:
                     result.parse_failed = True
                     break
                 if a in OTHER_GIT_SUBCOMMANDS:
                     break
-        i = k
+        i = k if inner is None else inner
     if split_failed:
         # Without tokens, anything that looks like git commit or add is scanned and the user is asked.
         result.parse_failed = bool(GIT_COMMIT_RE.search(command) or GIT_ADD_RE.search(command)
                                    or _loose_git(command, "commit") or _loose_git(command, "add"))
         result.obfuscated = result.obfuscated or bool(ANSI_C_ESCAPE_RE.search(command) and mentions_git)
+    result.dirs = _candidate_dirs(cwd, result.dir_values, result, command)
     if result.alias or result.obfuscated or result.parse_failed or result.indirect:
         result.commit = True  # scan the commit and ask
     if result.parse_failed:
@@ -863,7 +1175,10 @@ def _git(args, cwd, limit, deadline):
     env = dict(os.environ)
     env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat",
                 "GIT_EXTERNAL_DIFF": "", "LC_ALL": "C"})
-    cmd = ["git", "-c", "core.fsmonitor=false", "-c", "diff.external=", "-c", "core.quotePath=false"] + args
+    # diff.relative=false: diff paths are always relative to the top of the work tree, also when git
+    # runs in a subdirectory to resolve the pathspecs of `git add` or `git commit` there.
+    cmd = ["git", "-c", "core.fsmonitor=false", "-c", "diff.external=", "-c", "core.quotePath=false",
+           "-c", "diff.relative=false"] + args
     try:
         res = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              stdin=subprocess.DEVNULL, timeout=remaining)
@@ -1086,6 +1401,36 @@ def _exempt_text_argument(toks, cmds, n, script_write=False):
     return True
 
 
+# Shell operators, longest first. shlex returns a run of punctuation as one token (`);`, `)|`, `))`).
+SHELL_OPERATORS = (";;&", "<<<", "&>>", ";;", ";&", "&&", "||", "|&", "<<", ">>", "<&", ">&", "<>",
+                   ">|", "&>", ";", "&", "|", "(", ")", "<", ">")
+PUNCTUATION_RE = re.compile(r"^[();<>|&]+$")
+
+
+def _split_operators(tok):
+    """Split a run of shell punctuation such as `);` or `))` into separate operators."""
+    if len(tok) < 2 or not PUNCTUATION_RE.match(tok) or tok in SHELL_OPERATORS:
+        return [tok]
+    out, i = [], 0
+    while i < len(tok):
+        op = next(o for o in SHELL_OPERATORS if tok.startswith(o, i))
+        out.append(op)
+        i += len(op)
+    return out
+
+
+class _GroupStart(str):
+    """The `;` that _split puts before the tokens of an argument it splits again. It compares equal to
+    ";" (so it separates commands as before) and keeps the argument as `original`. `subshell` is
+    False only for `eval`, whose directory changes stay in effect after it."""
+    original = ""
+    subshell = True
+
+
+class _GroupEnd(str):
+    """The `;` that _split puts after the tokens of an argument it split again."""
+
+
 def _split(command, depth=0, hidden=None):
     """Shell-like tokens; an argument that is itself a command line (bash -c '...') is split again.
 
@@ -1094,7 +1439,9 @@ def _split(command, depth=0, hidden=None):
     Raises ValueError when the command cannot be tokenised (for example an unclosed quote)."""
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
-    toks = list(lex)
+    toks = []
+    for t in lex:
+        toks.extend(_split_operators(t))
     cmds = _command_words(toks)
     execution = _has_execution(toks, cmds)
     script_write = _writes_script_file(toks, cmds)
@@ -1107,9 +1454,12 @@ def _split(command, depth=0, hidden=None):
                                       and _program(toks[cmds[n]]) in TEXT_TOOLS)):
                 inner = t
             if inner is not None:
-                out.append(";")
+                start = _GroupStart(";")
+                start.original = t
+                start.subshell = cmds[n] is None or _program(toks[cmds[n]]) != "eval"
+                out.append(start)
                 out.extend(_split(inner, depth + 1, hidden))
-                out.append(";")
+                out.append(_GroupEnd(";"))
                 continue
         if (hidden is not None and re.search(r"\s", t) and (_loose_git(t, "commit") or _loose_git(t, "add"))
                 and not _exempt_text_argument(toks, cmds, n, script_write)):
@@ -1242,6 +1592,239 @@ def _binary_in_diff(label, path, root, limit, deadline):
                   unscanned=reason if text is None else cut)
 
 
+def _merge_jobs(items):
+    """[(job..., required)] -> [((job...), required)] without repeats; required wins."""
+    out = []
+    for item in items:
+        job, required = tuple((tuple(x) if isinstance(x, list) else x) for x in item[:-1]), item[-1]
+        for k, (other, req) in enumerate(out):
+            if other == job:
+                out[k] = (job, req or required)
+                break
+        else:
+            out.append((job, required))
+    return [(tuple(list(x) if isinstance(x, tuple) else x for x in job), req) for job, req in out]
+
+
+def _untracked_sources(listing, top, limit, deadline, seen):
+    """Sources for the untracked files in an `ls-files --others --full-name -z` listing of `top`.
+
+    A file whose real path is outside `top` (a symbolic link pointing out of the repository) is not
+    read; the link text, which is what git commits, is scanned instead."""
+    sources = []
+    if listing.text is None:
+        reason = TIME_LIMIT_REASON if listing.timed_out else "git could not list them"
+        return [Source("untracked files", "", 1, None, unscanned=reason)]
+    if listing.truncated:
+        sources.append(Source("untracked file list", "", 1, None, unscanned=_too_large(limit)))
+    for rel in [p for p in listing.text.split("\0") if p]:
+        path = os.path.join(top, rel)
+        if path in seen:
+            continue
+        seen.add(path)
+        label = rel + " (untracked, staged by git add)"
+        if time.monotonic() > deadline:
+            sources.append(Source(label, "", 1, rel, unscanned=TIME_LIMIT_REASON))
+            continue
+        if not _is_within(path, top):
+            # A symbolic link to a file outside the repository: git commits the link text, the
+            # target is not read.
+            try:
+                sources.append(Source(label + " (symbolic link)", os.readlink(path), 1, rel))
+            except OSError:
+                sources.append(Source(label, "", 1, rel, unscanned="file is outside the repository and was not read"))
+            continue
+        text, info = _read_text(path, limit)
+        if text is not None:
+            sources.append(Source(label, text, 1, rel, unscanned=_too_large(limit) if info else None))
+        elif info == "binary":
+            sources.append(Source(rel, "", 1, rel, binary_skipped=True))
+        elif not os.path.isdir(path):  # a nested repository is listed as a directory
+            sources.append(Source(label, "", 1, rel, unscanned="file is %s and was not read" % info))
+    return sources
+
+
+# One index entry of `git ls-files -s --debug -z`: the debug block of the previous entry comes first.
+INDEX_DEBUG_RE = re.compile(r"  ctime: (\d+):(\d+)\n  mtime: (\d+):(\d+)\n  dev: \d+\tino: (\d+)\n"
+                            r"  uid: \d+\tgid: \d+\n  size: (\d+)\tflags: \w+\n")
+INDEX_ENTRY_RE = re.compile(r"^([0-7]{6}) ([0-9a-f]{40,64}) ([0-3])\t(.*)$", re.S)
+
+
+def _index_entries(listing):
+    """Parse `git ls-files -s --debug -z` into (mode, object id, stage, path, stat) tuples, where
+    stat is (ctime, ctime_ns, mtime, mtime_ns, ino, size) as git recorded it, or None."""
+    entries, pending = [], None
+    for chunk in listing.split("\0"):
+        stat_info = None
+        m = INDEX_DEBUG_RE.match(chunk)
+        if m:
+            stat_info = tuple(int(x) for x in m.groups())
+            chunk = chunk[m.end():]
+        if pending is not None:
+            entries.append(pending + (stat_info,))
+            pending = None
+        e = INDEX_ENTRY_RE.match(chunk)
+        if e:
+            pending = (e.group(1), e.group(2), int(e.group(3)), e.group(4))
+    if pending is not None:
+        entries.append(pending + (None,))
+    return entries
+
+
+def _stat_unchanged(st, recorded, index_mtime):
+    """True when the file's stat data still matches what git recorded in the index and the entry is
+    not racy (the file was not changed in the same second the index was written)."""
+    if recorded is None or index_mtime is None:
+        return False
+    ctime, ctime_ns, mtime, mtime_ns, ino, size = recorded
+    if (int(st.st_mtime), int(st.st_ctime), st.st_size, st.st_ino) != (mtime, ctime, size, ino):
+        return False
+    for ns, value in ((mtime_ns, st.st_mtime_ns), (ctime_ns, st.st_ctime_ns)):
+        if ns and ns != value % 1000000000:
+            return False
+    return st.st_mtime < index_mtime
+
+
+def _object_id(data, oid):
+    """The git blob id of `data`, in the hash of `oid` (SHA-1 or SHA-256)."""
+    h = hashlib.sha256() if len(oid) == 64 else hashlib.sha1()
+    h.update(b"blob %d\0" % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
+def _added_runs(old, new):
+    """Runs of lines of `new` that are not in `old` (each line of `old` matches at most one line of
+    `new`), as (first line number, text). Linear in the size of both; carriage returns are ignored,
+    so a change of line endings alone adds nothing."""
+    remaining = collections.Counter(line.rstrip("\r") for line in old.split("\n"))
+    runs, run, start = [], [], 0
+    for number, line in enumerate(new.split("\n"), 1):
+        key = line.rstrip("\r")
+        if remaining[key] > 0:
+            remaining[key] -= 1
+            if run:
+                runs.append((start, "\n".join(run)))
+                run = []
+            continue
+        if not run:
+            start = number
+        run.append(line)
+    if run:
+        runs.append((start, "\n".join(run)))
+    return runs
+
+
+def _unstaged_sources(where, top, paths, limit, deadline, seen, seen_runs, required=True):
+    """Changes to tracked files under `paths` that are not staged yet, without `git diff`.
+
+    `git diff` against the working tree runs the clean filters (`filter.<driver>.clean`) that a
+    repository's git config and .gitattributes name. Instead the index is listed with
+    `git ls-files -s`, each working-tree file is read here, and a file whose stat data or blob id
+    differs from its index entry is compared with the staged blob (`git cat-file blob`, which runs no
+    filter). The working-tree bytes are scanned as they are, before any filter would change them."""
+    label = "unstaged diff"
+    listing = _git(["ls-files", "-s", "--debug", "--full-name", "-z", "--"] + paths, where, limit, deadline)
+    if listing.text is None and not listing.timed_out and not required:
+        return []  # git refuses these paths here, so git add or commit would fail here too
+    if listing.text is None:
+        reason = TIME_LIMIT_REASON if listing.timed_out else "git could not produce it"
+        return [Source(label, "", 1, None, unscanned=reason)]
+    sources = []
+    if listing.truncated:
+        sources.append(Source(label, "", 1, None, unscanned=_too_large(limit)))
+    index_path = _git(["rev-parse", "--git-path", "index"], top, 4096, deadline).text
+    try:
+        index_mtime = os.stat(os.path.join(top, index_path.strip())).st_mtime if index_path else None
+    except OSError:
+        index_mtime = None
+    entries = _index_entries(listing.text)
+    conflicted = {e[3] for e in entries if e[2] != 0}
+    for mode, oid, stage, rel, recorded in entries:
+        if (top, rel) in seen or (stage != 0 and stage != 2) or mode == "160000":
+            continue  # already done, other side of a conflict, or a submodule
+        seen.add((top, rel))  # keyed by repository too: one command line can touch several
+        path = os.path.join(top, rel)
+        if time.monotonic() > deadline:
+            sources.append(Source(rel, "", 1, rel, unscanned=TIME_LIMIT_REASON))
+            continue
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue  # deleted in the working tree: nothing of it is added
+        if mode == "120000" or stat.S_ISLNK(st.st_mode):
+            try:
+                data = os.readlink(path).encode("utf-8", errors="surrogateescape")
+            except OSError:
+                continue
+        elif stat.S_ISDIR(st.st_mode):
+            continue  # replaced by a directory; its files are untracked
+        elif not stat.S_ISREG(st.st_mode):
+            sources.append(Source(rel, "", 1, rel, unscanned="file is not a regular file and was not read"))
+            continue
+        else:
+            if rel not in conflicted and _stat_unchanged(st, recorded, index_mtime):
+                continue
+            data = None
+        if data is None:
+            if not _is_within(path, top):
+                sources.append(Source(rel, "", 1, rel, unscanned="file is outside the repository and was not read"))
+                continue
+            if st.st_size > limit:
+                # Not hashed or read: over the limit it could not be scanned in full anyway.
+                sources.append(Source(rel, "", 1, rel, unscanned=_too_large(limit)))
+                continue
+            if _same_blob(path, oid):
+                continue  # same content as staged
+            text, info = _read_text(path, limit)
+            if text is None:
+                if info == "binary":
+                    sources.append(Source(rel, "", 1, rel, binary_skipped=True))
+                else:
+                    sources.append(Source(rel, "", 1, rel, unscanned="file is %s and was not read" % info))
+                continue
+            if info:  # larger than max_scan_bytes
+                sources.append(Source(rel, "", 1, rel, unscanned=_too_large(limit)))
+        else:
+            if _object_id(data, oid) == oid:
+                continue
+            text = data.decode("utf-8", errors="replace")
+        old = ""
+        if rel not in conflicted:
+            blob = _git(["cat-file", "blob", oid], top, limit, deadline)
+            if blob.text is None and blob.timed_out:
+                sources.append(Source(rel, "", 1, rel, unscanned=TIME_LIMIT_REASON))
+                continue
+            old = blob.text or ""  # if the blob cannot be read, the whole file is scanned
+        for first, run in _added_runs(old, text):
+            if (top, rel, first, run) not in seen_runs:
+                seen_runs.add((top, rel, first, run))
+                sources.append(Source(rel, run, first, rel))
+    return sources
+
+
+def _same_blob(path, oid):
+    """True when the regular file at `path` hashes to `oid` (read in pieces, without blocking)."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(fd)
+            return False
+        h = hashlib.sha256() if len(oid) == 64 else hashlib.sha1()
+        h.update(b"blob %d\0" % st.st_size)
+        with os.fdopen(fd, "rb") as fh:
+            for piece in iter(lambda: fh.read(1 << 20), b""):
+                h.update(piece)
+        return h.hexdigest() == oid
+    except OSError:
+        return False
+
+
 def commit_sources(command, cwd, config, notes, deadline, parsed=None):
     limit = config["max_scan_bytes"]
     cmd_text, cut = _limited(command, limit)
@@ -1295,31 +1878,83 @@ def commit_sources(command, cwd, config, notes, deadline, parsed=None):
         return sources, None
     root = found.text.strip()
     diff_args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=0", "--diff-filter=ACMRT"]
-    diffs = [("staged diff", _git(diff_args + ["--cached"], root, limit, deadline))]
-    if parsed.add or parsed.commit_all:
-        # tracked changes not yet staged
-        diffs.append(("unstaged diff", _git(diff_args, root, limit, deadline)))
-    if parsed.add_all:
-        listing = _git(["ls-files", "--others", "--exclude-standard", "-z"], root, limit, deadline)
-        if listing.text is None:
-            reason = TIME_LIMIT_REASON if listing.timed_out else "git could not list them"
-            sources.append(Source("untracked files", "", 1, None, unscanned=reason))
-        elif listing.truncated:
-            sources.append(Source("untracked file list", "", 1, None, unscanned=_too_large(limit)))
-        for rel in [p for p in (listing.text or "").split("\0") if p]:
-            path = os.path.join(root, rel)
-            label = rel + " (untracked, staged by git add)"
-            if time.monotonic() > deadline:
-                sources.append(Source(label, "", 1, rel, unscanned=TIME_LIMIT_REASON))
+    # Working-tree content that the command line takes into the commit: (cwd, pathspecs, required)
+    # for tracked changes not yet staged, (cwd, pathspecs, force, required) for untracked files.
+    # [":/"] is the whole tree. Each git add and git commit is resolved in its own directory as far
+    # as the parser can follow it (required: git must answer there) and, in addition, in every
+    # other directory the command line may change into (parsed.dirs; skipped where there is no
+    # repository, since git add and git commit would fail there too).
+    tracked, untracked = [], []
+    others = [d for d in parsed.dirs if os.path.isdir(d)]
+    if parsed.parse_failed:
+        tracked.append((root, [":/"], True))
+        untracked.append((root, [":/"], False, True))
+    elif parsed.commit_all:
+        tracked.append((root, [":/"], True))
+        tracked.extend((d, [":/"], False) for d in others)
+    for spec in parsed.path_specs:
+        spec_cwd = spec.cwd if os.path.isdir(spec.cwd) else commit_cwd
+        if not spec.problem and spec_cwd != spec.cwd:
+            spec.problem = "its directory %s does not exist yet" % spec.cwd
+        if spec.problem or parsed.unresolved_dir:
+            if spec.problem:
+                sources.append(Source("%s arguments" % spec.command, "", 1, None,
+                                      unscanned="the hook could not tell which files it takes (%s); "
+                                      "the whole repository was scanned instead" % spec.problem))
+            tracked.append((spec_cwd, [":/"], True))
+            tracked.extend((d, [":/"], False) for d in others)
+            if spec.command != "git commit":
+                untracked.append((spec_cwd, [":/"], spec.force, True))
+                untracked.extend((d, [":/"], spec.force, False) for d in others)
+            if spec.problem:
                 continue
-            text, info = _read_text(path, limit)
-            if text is not None:
-                sources.append(Source(label, text, 1, rel, unscanned=_too_large(limit) if info else None))
-            elif info == "binary":
-                sources.append(Source(rel, "", 1, rel, binary_skipped=True))
-            elif not os.path.isdir(path):  # a nested repository is listed as a directory
-                sources.append(Source(label, "", 1, rel, unscanned="file is %s and was not read" % info))
-    for label, result in diffs:
+        if spec.tracked is not None:
+            tracked.append((spec_cwd, spec.tracked or [":/"], True))
+            tracked.extend((d, spec.tracked or [":/"], False) for d in others)
+        if spec.untracked is not None:
+            untracked.append((spec_cwd, spec.untracked or [":/"], spec.force, True))
+            untracked.extend((d, spec.untracked or [":/"], spec.force, False) for d in others)
+    tops = {commit_cwd: root}
+    seen_files, seen_runs = set(), set()
+
+    def top_of(where):
+        if where not in tops:
+            res = _git(["rev-parse", "--show-toplevel"], where, 4096, deadline)
+            tops[where] = res.text.strip() if res.text else None
+        return tops[where]
+
+    diffs = [("staged diff", root, _git(diff_args + ["--cached"], root, limit, deadline))]
+    # Every `git commit` in the command line commits the staged state of its own repository, which
+    # may be the repository of any directory the command line may change into.
+    commit_dirs = [(spec.cwd, True) for spec in parsed.path_specs
+                   if spec.command == "git commit" and os.path.isdir(spec.cwd)]
+    for where, required in commit_dirs + [(d, False) for d in others]:
+        top = top_of(where)
+        if top is None:
+            if required:
+                sources.append(Source("staged diff", "", 1, None, unscanned="git could not produce it "
+                                      "for the commit in %s" % where))
+        elif top not in [d[1] for d in diffs]:
+            diffs.append(("staged diff", top, _git(diff_args + ["--cached"], top, limit, deadline)))
+    seen_tracked = set()
+    for (where, paths), required in _merge_jobs(tracked):
+        top = top_of(where)
+        if top is None:
+            if required:
+                sources.append(Source("unstaged diff", "", 1, None, unscanned="git could not produce it"))
+            continue
+        sources.extend(_unstaged_sources(where, top, paths, limit, deadline, seen_tracked, seen_runs,
+                                         required))
+    for (where, paths, force), required in _merge_jobs(untracked):
+        top = top_of(where)
+        if top is None and not required:
+            continue
+        args = ["ls-files", "--others", "--full-name", "-z"] + ([] if force else ["--exclude-standard"])
+        listing = _git(args + ["--"] + paths, where, limit, deadline) if top else GitResult()
+        if listing.text is None and not listing.timed_out and not required:
+            continue  # git refuses these paths here, so git add or commit would fail here too
+        sources.extend(_untracked_sources(listing, top, limit, deadline, seen_files))
+    for label, top, result in diffs:
         if result.text is None:
             reason = TIME_LIMIT_REASON if result.timed_out else "git could not produce it"
             sources.append(Source(label, "", 1, None, unscanned=reason))
@@ -1327,9 +1962,13 @@ def commit_sources(command, cwd, config, notes, deadline, parsed=None):
         if result.truncated:
             sources.append(Source(label, "", 1, None, unscanned=_too_large(limit)))
         for path, first, text in parse_diff(result.text):
-            sources.append(Source(path, text, first, path))
+            if (top, path, first, text) not in seen_runs:
+                seen_runs.add((top, path, first, text))
+                sources.append(Source(path, text, first, path))
         for path in binary_diff_paths(result.text):
-            sources.append(_binary_in_diff(label, path, root, limit, deadline))
+            if (top, path) not in seen_runs:
+                seen_runs.add((top, path))
+                sources.append(_binary_in_diff(label, path, top, limit, deadline))
     return sources, root
 
 

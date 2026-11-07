@@ -95,6 +95,15 @@ class TestFileTools(HookCase):
             self.assertDecision(out, "deny")
             self.assertNotIn(value, json.dumps(out))
 
+    def test_config_file_name_in_other_case_asks(self):
+        # On a case-insensitive file system this is the same file as pii-guard.json.
+        for name in ("pii-guard.json", "PII-Guard.json", "sub/PII-GUARD.JSON"):
+            code, out, _ = self.run_hook("Write", {"file_path": str(self.repo / name), "content": "{}\n"},
+                                         env={"PII_GUARD_MODE": "warn"})
+            self.assertEqual(code, 0)
+            self.assertDecision(out, "ask")
+            self.assertIn("edits pii-guard's configuration", out["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_warn_mode_allows_with_message(self):
         (self.repo / ".git").mkdir()
         (self.repo / "pii-guard.json").write_text(json.dumps({"mode": "warn"}))

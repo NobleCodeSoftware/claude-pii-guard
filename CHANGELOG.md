@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-11-07
+
+This release makes the documentation describe what the code actually does. Apart from the file name
+comparison below, behaviour is unchanged.
+
+### Fixed
+
+- A file tool call that writes `PII-Guard.json` (or any other spelling of `pii-guard.json` in a
+  different case) now asks the user like `pii-guard.json` does. On a case-insensitive file system,
+  the default on macOS and Windows, it is the same file.
+- Documentation corrected where it promised more than the code does:
+  - The short description in `plugin.json`, `marketplace.json` and the README now says that file
+    edits and git commits are checked; other shell commands, including writes with `>`, a heredoc,
+    `cp` or `sed -i`, are not scanned for data.
+  - Only `block` mode denies a call with a finding; `ask` mode asks and `warn` mode lets it through.
+    A table in the README shows the decision for each mode.
+  - The phrases file is not kept out of commits: pii-guard only refuses to use a phrases file inside
+    the repository it scans.
+  - The IBAN example now shows the message the hook really prints (`IBAN` with the masked value).
+  - Card numbers have 13 to 19 digits, not 12 to 19.
+  - Phrases are matched as case-insensitive substrings, without word boundaries.
+  - A standalone number can still be reported if it looks like a phone number or passes a PESEL,
+    IBAN or card check.
+  - Private phrases in the replaced text of an `Edit` are reported again; line numbers for `Edit`
+    and `MultiEdit` are approximate.
+  - The whole `git commit` command line is scanned, and the supported `-F` forms are listed.
+  - Directory changes other than `cd`, `pushd` and `git -C` (for example `env -C`, `sudo -D`,
+    PowerShell `Set-Location`) are not followed, so the commit scan can be narrower than what git
+    adds. The 0.1.4 entry said "never narrower"; that was wrong.
+  - After a here-document operator an unknown option is skipped, and an unclassifiable path makes
+    the whole repository count.
+  - Only a quoted `git commit` or `git add` written to a script-like file asks, not any text.
+  - Cases where the call goes through with at most a note are listed: no git repository or no git,
+    a `-F` file that does not exist yet, a missing phrases file, a configuration file with invalid
+    JSON.
+  - The phrases file must be UTF-8 without a byte order mark: invalid UTF-8 makes the hook fail and
+    block every matched call, and a byte order mark spoils the first phrase.
+  - The 8-second deadline is a design target and does not cover reading configuration and phrases
+    files; scan time also grows with the number of phrases.
+  - Detected values are masked, but file paths and command arguments in messages are not.
+  - Guard changes ask as far as the hook recognises them; what it does not recognise is listed,
+    including a user config directory path spelled in another case. In `warn` mode a change to the
+    guard asks even when it comes with a finding.
+  - A repository config also overrides `allow_trailers` and `max_scan_bytes`, and with the default
+    `repo_config: "full"` a cloned repository can relax the checks without a prompt.
+  - The default phrases file is `phrases.txt` in the user config directory.
+  - pii-guard makes no network connections of its own; in a partial clone git may fetch missing
+    objects.
+  - The privacy policy says that pii-guard does not send the phrases file and does not put its
+    content in its output, rather than that the file never leaves the machine, and that its messages
+    become part of the Claude Code session.
+- Documented behaviour that was missing: binary files (such as `.xlsx`, `.docx`, `.pdf` and
+  images) are skipped; addresses whose domain ends in a file extension such as `.md`, `.py` or `.rs`
+  are not reported; tools that only read data are not checked; message limits (20 findings, 10
+  reasons); `max_scan_bytes` counts characters for tool input; a value in a line longer than one
+  scan piece can be missed; the `scan` command takes files only and reads the working tree.
+- Code comments no longer promise more than the code does (network, time limit, scan time).
+- README and privacy policy state that pii-guard does not make you compliant with any data
+  protection law.
+
 ## [0.1.4] - 2026-11-06
 
 ### Fixed
@@ -30,8 +90,9 @@ All notable changes to this project are documented here. The format follows
   followed, so later `git add` and `git commit` paths could be resolved in the wrong directory and
   nothing was scanned. Relative paths are now resolved against every directory the command may
   change into: the starting directory and every existing directory reachable through any `cd`,
-  `pushd` or `git -C` in the command line. The scan can be wider than what git will add, never
-  narrower. A directory that cannot be resolved (an expansion, `cd -`, a `popd` without `pushd`, a
+  `pushd` or `git -C` in the command line. The scan can be wider than what git will add. (Corrected
+  in 0.1.5: other ways of changing directory are not followed, so the scan can also be narrower.)
+  A directory that cannot be resolved (an expansion, `cd -`, a `popd` without `pushd`, a
   directory that does not exist yet, `CDPATH` set for a relative `cd`) makes the whole of every
   repository involved count, and the user is asked.
 - The tokenizer returned `);`, `)|`, `)&` and `))` as single words, so they did not end a

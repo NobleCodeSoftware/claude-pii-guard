@@ -82,7 +82,10 @@ class TestPluginLayout(unittest.TestCase):
         self.assertFalse(plugin["name"].startswith(("claude-", "anthropic-")))  # reserved prefixes
         self.assertEqual(plugin["license"], "MIT")
         self.assertEqual(plugin["version"], g.VERSION)
-        self.assertTrue(plugin["description"].startswith("Catches common personal data before Claude Code writes or commits it."))
+        summary = "Checks Claude Code file edits and git commits for common personal data before they run."
+        self.assertTrue(plugin["description"].startswith(summary))
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(" ".join(summary.split()), " ".join(readme.split()))
         self.assertIn("Not affiliated with Anthropic", plugin["description"])
         self.assertTrue((ROOT / plugin["icon"]).is_file())
         self.assertFalse(plugin["icon"].startswith("./.claude-plugin/"))  # only manifests live there

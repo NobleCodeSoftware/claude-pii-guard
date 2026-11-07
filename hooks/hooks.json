@@ -1,5 +1,5 @@
 {
-  "description": "pii-guard: scan file writes and git commits for personal data before they happen",
+  "description": "pii-guard: scan file-tool writes and git commits for personal data before they happen",
   "hooks": {
     "PreToolUse": [
       {

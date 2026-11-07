@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""pii-guard: a Claude Code PreToolUse hook that catches common personal data before it is written
-or committed.
+"""pii-guard: a Claude Code PreToolUse hook that checks file-tool writes and git commits for common
+personal data before they run. Other shell commands are not scanned for data.
 
 Standard library only. The hook reads the PreToolUse JSON from stdin, scans the text that a tool call
 is about to write (Write, Edit, MultiEdit, NotebookEdit) or commit (Bash or PowerShell running
 `git commit`), and prints a decision as JSON on stdout.
 
 Safety properties (please keep them when you change this file):
-- no network access; the only module that talks to the outside world is `subprocess`, used to run
-  `git` with a fixed argument list (no shell) and with external diff drivers, textconv and
-  fsmonitor disabled;
+- no network connections of its own; the only module that talks to the outside world is
+  `subprocess`, used to run `git` with a fixed argument list (no shell) and with external diff
+  drivers, textconv and fsmonitor disabled (in a partial clone git may still fetch missing objects);
 - file contents are only read and matched with regular expressions, never executed or evaluated;
 - configuration is parsed with `json`, phrases are plain text lines.
 
 Exit codes: 0 with JSON on stdout (or nothing) is the normal path. 1 means the hook itself failed
-(bad input). On its own Claude Code treats exit 1 as a non-blocking error, but hooks/hooks.json
+(bad input, including a phrases file that is not valid UTF-8). On its own Claude Code treats exit 1 as a non-blocking error, but hooks/hooks.json
 declares the hook with `"onFailure": "block"`, so the tool call is blocked. The CLI `scan` mode exits 1
 when it finds something or a file could not be scanned, so it can be used from CI or a git pre-commit
 hook.
 
-Time budget: one hook run has a single deadline (TIME_BUDGET_SECONDS) shared by every git call, file
-read and scan step. Each git call may only use the time that is left, so the run stays well below the
-15-second timeout in hooks/hooks.json; whatever is not done by the deadline is reported as not
-scanned.
+Time budget: one hook run has a single deadline (TIME_BUDGET_SECONDS) shared by every git call, read
+of a scanned file and scan step. Each git call may only use the time that is left, which is designed
+to keep the run below the 15-second timeout in hooks/hooks.json; whatever is not done by the deadline
+is reported as not scanned. Reading the configuration and phrases files, and the current file for a
+Write or Edit, is not covered by the deadline.
 """
 
 import bisect
@@ -38,7 +39,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 # Shared deadline for one hook run, in seconds. Keep it well below the "timeout" in hooks/hooks.json
 # (15 s), which also has to cover starting Python.
@@ -237,7 +238,8 @@ def normalize(value):
 
 
 def _candidates(text, config, phrases):
-    """All raw matches as (start, priority, end, kind, value). Linear in the size of `text`."""
+    """All raw matches as (start, priority, end, kind, value). Time grows with the size of `text` and
+    the number of private phrases (each phrase is searched separately)."""
     det = config["detectors"]
     local_parts = {p.lower() for p in config["allow_local_parts"]}
     raw = []
@@ -302,8 +304,9 @@ def scan_text(text, config, phrases=(), skip_line=None, limit=None):
     """Return the findings in `text`, at most `limit` of them. Line numbers are 1-based.
 
     `skip_line(prefix)` gets up to 200 characters between the start of the line and the finding; a
-    true result drops the finding (used for commit trailers). Every step is linear or n log n in the
-    size of the text, and each line is checked for allow markers at most once."""
+    true result drops the finding (used for commit trailers). Time grows with the size of the text
+    and the number of private phrases (see _candidates), and each line is checked for allow markers
+    at most once."""
     allow_values = {normalize(v) for v in config["allow_values"]}
     markers = [m.lower() for m in config["allow_markers"] if m]
     kept = _resolve_overlaps(_candidates(text, config, phrases))
@@ -631,10 +634,13 @@ def marker_added(tool, tin, config):
 
 
 def touches_guard_config(path):
-    """True for pii-guard's own configuration: any pii-guard.json and the user config directory."""
+    """True for pii-guard's own configuration: any pii-guard.json and the user config directory.
+
+    The file name is compared without regard to case, because on a case-insensitive file system
+    (the default on macOS and Windows) `PII-Guard.json` is the same file as `pii-guard.json`."""
     if not path:
         return False
-    if os.path.basename(path.replace("\\", "/")) == REPO_CONFIG_NAME:
+    if os.path.basename(path.replace("\\", "/")).lower() == REPO_CONFIG_NAME:
         return True
     return _is_within(_expand(path), os.path.dirname(user_config_path()))
 
@@ -959,7 +965,8 @@ def _candidate_dirs(cwd, values, result, command):
     directory and every existing directory that any cd, pushd or git -C value in the command line
     leads to, from any directory already in the set, are all candidates (repeated until nothing new
     is added). Relative pathspecs are resolved against each of them, which can scan more than git
-    will add, never less. A value that cannot be resolved (an expansion, `cd -`, a directory that does
+    will add. Other ways of changing directory (`env -C`, `sudo -D`, PowerShell `Set-Location`) are
+    not followed, so then the scan can miss what git adds. A value that cannot be resolved (an expansion, `cd -`, a directory that does
     not exist yet, `CDPATH`) sets `unresolved_dir`; the hook then scans whole repositories and asks."""
     dirs = [os.path.normpath(cwd)]
     cdpath = bool(os.environ.get("CDPATH")) or bool(re.search(r"(?:^|[\s;&|(])(?:export\s+)?CDPATH=", command))

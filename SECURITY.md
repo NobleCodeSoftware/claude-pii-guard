@@ -44,26 +44,37 @@ and misconfiguration of your own installation.
 ## Security design
 
 - Standard library only; no third-party dependencies to audit or update.
-- No network access. The only subprocess is `git` with a fixed argument list, no shell, a timeout,
-  and `--no-ext-diff`, `--no-textconv`, `diff.external=` and `core.fsmonitor=false`. `git diff` is
+- No network connections of its own. The only subprocess is `git` with a fixed argument list, no
+  shell, a timeout, and `--no-ext-diff`, `--no-textconv`, `diff.external=` and `core.fsmonitor=false`. `git diff` is
   run only between the index and `HEAD` (`--cached`), and working-tree files are read by the hook
   itself and compared with the staged blobs (`git cat-file blob`), so the hook runs no external diff
   program, textconv driver, fsmonitor hook or clean filter configured in a repository's git config
-  or `.gitattributes`. Tests check this for external diff, textconv and clean filters.
+  or `.gitattributes`. Tests check this for external diff, textconv and clean filters. The git
+  commands are local reads, but in a partial clone git may download missing objects on its own.
 - Scanned content is only matched with regular expressions; configuration is parsed with `json`.
 - The hook is declared with `onFailure: "block"`: a crash or timeout blocks the action instead of
-  letting it through. The scan is linear in the input size and stops after 50 findings. One hook run
-  has a single 8 s deadline shared by all `git` calls, file reads and scanning, so it stays below
-  the 15 s hook timeout. Content it could not scan (over `max_scan_bytes`, unreadable, not a regular
-  file, out of time) leads to a permission prompt (a warning in `warn` mode), not to a silent allow.
-  Binary files in a commit are not scanned and are listed in a visible note; the `scan` command
-  reports them as skipped. Files are opened only if they are regular files, so a FIFO or device
-  cannot stall the hook.
+  letting it through. Scan time grows with the input size and the number of private phrases, and
+  the scan stops after 50 findings. One hook run has a single 8 s deadline shared by the `git`
+  calls, the reads of scanned files and the scanning, designed to keep it below the 15 s hook
+  timeout; reading the configuration and phrases files, and the current file for a `Write` or
+  `Edit`, is not covered by it. Content it could not
+  scan (over `max_scan_bytes`, unreadable, not a regular file, out of time) leads to a permission
+  prompt (a warning in `warn` mode). Exceptions, where the call is allowed with at most a note: the
+  commit directory is not a git repository or git cannot run (only the command line and existing
+  `-F` message files are scanned), a `-F` message file does not exist when the hook runs, the
+  private phrases file is missing or unreadable (phrase detection is then off), or a configuration
+  file is not valid JSON (it is ignored with a note). A phrases file that is not valid UTF-8 makes
+  the hook fail, which blocks every matched call. Binary files in a commit are not scanned and are listed
+  in a visible note; the `scan` command reports them as skipped. Scanned files and commit message
+  files are opened only if they are regular files, so a FIFO or device there cannot stall the hook;
+  the configuration and phrases files are opened directly, so keep them regular files.
 - The deny message tells Claude not to add exceptions itself; new allow markers and changes to
-  pii-guard's configuration always ask the user.
-- Values in messages are masked (PESEL shows only its last two digits). The private phrases file is
-  read only from the user's configuration or environment and is refused if it lies inside the
-  repository being scanned.
+  pii-guard's configuration ask the user in every mode, as far as the hook recognises them (see
+  "What you see" in the README for what it does not recognise).
+- Detected values in messages are masked (PESEL shows only its last two digits); file paths and
+  command arguments are shown as they are. The private phrases file is read only from the user's
+  configuration or environment and is refused if it lies inside the repository being scanned; the
+  hook does not stop the file from being committed or read by other tools.
 
 ## Guidance for users
 

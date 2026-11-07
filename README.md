@@ -1,15 +1,18 @@
 # pii-guard for Claude Code
 
-Catches common personal data before Claude Code writes or commits it. A local PreToolUse hook that
-detects emails, phone numbers, PESEL, IBAN and Luhn-valid card numbers, plus your own private
-phrases kept outside the repo, in block, ask or warn mode. No network access. Not affiliated with
-Anthropic; built and maintained by AI agents at NobleCode.
+Checks Claude Code file edits and git commits for common personal data before they run. A local
+PreToolUse hook that detects emails, phone numbers, PESEL, IBAN and Luhn-valid card numbers, plus
+your own private phrases from a file outside the repository, in block, ask or warn mode. It makes no
+network connections of its own. Not affiliated with Anthropic; built and maintained by AI agents at
+NobleCode.
 
-The hook checks what Claude is about to write (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) or
-commit (`git commit` from `Bash` or `PowerShell`). If it finds personal data, it blocks the call (or
-warns, or asks you, as you prefer) and tells Claude where the value is, masked.
+The hook checks what Claude is about to write with a file tool (`Write`, `Edit`, `MultiEdit`,
+`NotebookEdit`) or commit (`git commit` from `Bash` or `PowerShell`). If it finds personal data, it
+blocks the call (or warns, or asks you, as you prefer) and tells Claude where the value is, masked.
+Other shell commands are not scanned for data: a file written with `>`, a heredoc, `cp` or `sed -i`
+is checked only when a later `git commit` takes it.
 
-> Status: early release (v0.1.4). A single Python file using only the standard library, plus tests.
+> Status: early release (v0.1.5). A single Python file using only the standard library, plus tests.
 > Read "Limitations" before you rely on it.
 
 ## The problem
@@ -19,9 +22,11 @@ spreadsheet, your own git config. That data then ends up in fixtures, docs, exam
 messages, and from there in a public repository. It is easy to do by accident and hard to undo once
 pushed.
 
-Review catches most of it, but review is the last line. pii-guard adds an earlier one: a write or
-commit in which it finds such data does not happen until the data is replaced with synthetic values
-or explicitly allowed.
+Review catches most of it, but review is the last line. pii-guard adds an earlier one: in the
+default `block` mode, a file-tool write or `git commit` in which it finds such data is denied until
+the data is replaced or you add an exception. In `ask` mode you decide in the permission prompt; in
+`warn` mode the call goes through with a warning. pii-guard is a technical aid; it does not make you
+compliant with any data protection law.
 
 ## Install (2 commands, plus optional configuration)
 
@@ -33,7 +38,9 @@ Inside Claude Code:
 ```
 
 Then, in your shell, optionally add your private phrases (names, client codenames, your own
-address). This file lives **outside every repository** and is never committed:
+address). Keep this file **outside every repository**. pii-guard does not use a phrases file inside
+the repository it scans, but it does not stop the file from being committed (for example when your
+home directory is a dotfiles repository):
 
 ```bash
 mkdir -p ~/.config/pii-guard
@@ -62,24 +69,30 @@ From the shell, the same steps are
 
 | Detector | How | Notes |
 |---|---|---|
-| `email` | address pattern | `example.com`, `example.org`, `example.net`, `localhost`, GitHub noreply addresses and senders such as `noreply@` and `git@` are allowed by default; `logo@2x.png` is ignored |
+| `email` | address pattern | `example.com`, `example.org`, `example.net`, `localhost`, GitHub noreply addresses and senders such as `noreply@` and `git@` are allowed by default; `logo@2x.png` is ignored, and so is any address whose domain ends in a file extension such as `.md`, `.py` or `.rs` (also real country domains) |
 | `phone` | international `+` numbers with 8 to 15 digits (E.164); Polish formats such as `500 000 004`, `500-000-005`, `(22) 000 00 03`; a bare 9-digit number only after a word such as `tel`, `phone`, `mobile`, `fax` | |
 | `pesel` | 11 digits, checksum **and** a real calendar date (centuries 1800 to 2299) | |
 | `iban` | country code, country length table and mod-97 check; also the 26-digit Polish account number (NRB) | |
-| `card` | 12 to 19 digits, Luhn check **and** a known network prefix and length (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro) | |
-| `phrases` | case-insensitive match of each line of your private phrases file | never stored in the repository |
+| `card` | 13 to 19 digits, Luhn check **and** a known network prefix and length (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro) | |
+| `phrases` | case-insensitive substring match of each line of your private phrases file (3 or more characters, not starting with `#`), without word boundaries: `Ann` also matches `annual` | read from your user configuration, not from the repository |
 
-Digit detectors do not match inside longer numbers, hashes or identifiers, so version numbers, git
-hashes, UUIDs, dates, timestamps and order numbers are not reported. The test suite has a list of
-these false-positive cases.
+Digit detectors do not match fragments of longer numbers, hashes or identifiers, which keeps most
+version numbers, git hashes, UUIDs, dates and timestamps out of the report. A standalone number can
+still be reported if it looks like a phone number (for example three groups of three digits) or
+passes a PESEL, IBAN or card check. The test suite has a list of false-positive cases.
 
 ## What is scanned
 
 - `Write`: the whole new content. `NotebookEdit`: the new cell source.
 - `Edit` and `MultiEdit`: the new text only. A value that was already in the replaced text is not
-  reported again, so you can edit near existing data without noise. Line numbers refer to the file.
-- `git commit`: the staged diff (added lines only), the commit command with its `-m` messages, and
-  `-F` message files. Commit trailers such as `Signed-off-by:` are allowed (switch off with
+  reported again, so you can edit near existing data without noise; private phrases are the
+  exception and are reported again. Line numbers are approximate: they point to the first occurrence
+  of the replaced text in the file before the edit (line 1 if it is not found).
+- `git commit`: the staged diff (added lines only), the whole command line including its `-m`
+  messages, and message files given as `-F FILE`, `-FFILE`, `--file FILE` or `--file=FILE` (not
+  inside combined flags such as `-aF FILE`; a message file that does not exist yet when the hook runs
+  is skipped). Other shell commands are not scanned for data; the hook only checks whether they
+  touch pii-guard's configuration (see "What you see"). Commit trailers such as `Signed-off-by:` are allowed (switch off with
   `"allow_trailers": false`).
 - Working-tree content that `git add` (or its synonym `git stage`) or `git commit` in the same
   command line takes into the commit, read from the working tree before the command runs:
@@ -97,14 +110,16 @@ these false-positive cases.
   subshell may or may not), so relative paths are resolved against every directory the command
   may change into: the starting directory and every existing directory reachable through any
   `cd`, `pushd` or `git -C` in the command line. The scan can therefore be wider than what git will
-  add. Each repository found this way also has its staged diff scanned. Arguments are told apart
+  add. Other ways of changing directory, such as `env -C`, `sudo -D` or PowerShell `Set-Location`,
+  are not followed: the starting directory is checked instead, without a prompt, so the scan can
+  miss what git adds. Each repository found this way also has its staged diff scanned. Arguments are told apart
   from the
   values of options such as `-m`, `-F`, `-C`, `-c`, `-t`, `--author`, `--date`, `--fixup`,
   `--squash`, `--cleanup` and `--trailer`. When the hook cannot tell which files an argument list
   takes, the unstaged changes and untracked files of the whole repository are scanned and you are
   asked (see below). After a here-document operator (`<<EOF`) the hook cannot tell the document's
-  body from arguments, so a word there that it cannot classify makes the whole repository count,
-  without a prompt.
+  body from arguments, so a path there that it cannot classify makes the whole repository count and
+  an unknown option there is skipped, both without a prompt.
 
   Unstaged changes are found without `git diff`, which would run the clean filters
   (`filter.<driver>.clean` or `.process`) named in the repository's git config and
@@ -130,10 +145,11 @@ How a commit is found in a shell command:
   only when the command line runs nothing else: as soon as it also starts a shell, an interpreter,
   a remote session, `source`, `exec`, `eval`, `xargs`, a program given by path, or one of the
   runners above, the text tools' quoted arguments are checked as commands too.
-- Text that a text tool writes to a file that looks like a script (`.sh`, `.bash`, `.zsh`, `.ksh`,
-  `.ps1`, `.command`, or no extension) may be run later, so it is scanned and asks. Writing to
-  `.md`, `.txt` and other data files with `echo`, `printf` or `tee` stays silent; a heredoc is
-  different (see "Limitations").
+- A quoted `git commit` or `git add` that a text tool writes to a file that looks like a script
+  (`.sh`, `.bash`, `.zsh`, `.ksh`, `.ps1`, `.command`, or no extension) may be run later, so it is
+  treated as a commit and asks. Other text written to such a file is not scanned. Writing to `.md`,
+  `.txt` and other data files with `echo`, `printf` or `tee` stays silent; a heredoc is different
+  (see "Limitations").
 
 Content that could not be scanned: up to `max_scan_bytes` (default 5 MB) per file, diff or message
 is scanned, in 1 MB pieces. The following is **not** allowed silently; in `block` and `ask` mode you
@@ -147,6 +163,21 @@ get the permission prompt, in `warn` mode a warning:
   or a file without a text diff whose content could
   not be read;
 - anything left when the time budget runs out (see below).
+
+Exceptions, where the call goes through with at most a note, in every mode:
+
+- the commit directory is not a git repository when the hook runs, or git cannot run: only the
+  command line and existing `-F` message files are scanned, and without a finding the call is
+  allowed with a note. For example
+  `git init && git add -A && git commit -m init` in a directory that is not yet a repository commits
+  every file without a scan;
+- a message file (`-F`) that does not exist when the hook runs is skipped;
+- a missing or unreadable private phrases file (also one named in `PII_GUARD_PHRASES`) switches
+  phrase detection off without a message (a file that is not valid UTF-8 is different: see
+  "Private phrases file" below);
+- a configuration file that is not valid JSON is ignored with a note: a broken user config means
+  the defaults apply (its `repo_config` setting is lost too), and a broken repository config leaves
+  the user config in effect.
 
 In these cases the commit is scanned as well as possible and you are asked too:
 
@@ -182,11 +213,18 @@ Time budget: one hook run has a single 8-second deadline, shared by every `git` 
 the staged diff, the index listings, the untracked file lists, two `cat-file` calls per staged file
 without a text diff, and one per changed tracked file in the working tree), every file read and the
 scan itself. Each `git` call gets only the time that is left and is stopped at the deadline.
-Whatever is not done by then counts as not scanned, as above. This keeps the hook, including Python
-start-up, below its 15-second timeout in `hooks/hooks.json`.
+Whatever is not done by then counts as not scanned, as above. This is designed to keep the hook,
+including Python start-up, below its 15-second timeout in `hooks/hooks.json`. Reading the
+configuration and phrases files, and reading the current file for a `Write` or `Edit`, are not
+covered by the deadline.
+
+Content from the tool call itself (`Write`, `Edit`, the command line) is limited by `max_scan_bytes`
+counted in characters. The scan runs in 1 MB pieces cut at line ends, so a value in a single line
+longer than that (for example minified JSON) can be split between two pieces and missed.
 
 The scan stops after 50 findings, since one is enough for a decision; the message then says
-"50 or more findings".
+"50 or more findings". The message lists at most 20 findings and 10 reasons why content could not be
+scanned.
 
 ## What you see
 
@@ -199,14 +237,32 @@ Replace it with synthetic data (for example user@example.com) or remove it.
 Do not add exceptions or allow markers yourself; ask the user.
 ```
 
-Values are always masked, so the message itself does not repeat the data. The message tells Claude
+Detected values are masked, so the message does not repeat them. File paths and command arguments
+in the message are shown as they are; file names are not scanned. The message tells Claude
 not to work around the guard, and does not explain how; exceptions are your decision (see
 Configuration). You see the same message, with a pointer to this README.
+
+How each mode decides:
+
+| Mode | Personal data found | Content that could not be scanned | Change to the guard (below) |
+|---|---|---|---|
+| `block` | denied, even if the other two also apply | permission prompt | permission prompt |
+| `ask` | permission prompt | permission prompt | permission prompt |
+| `warn` | allowed with a warning | allowed with a warning | permission prompt |
+
+In `warn` mode a finding or unscanned content together with a change to the guard also gets the
+permission prompt. In `block` mode a finding cannot be approved in a prompt: replace the value, add an
+exception to the configuration or change the mode.
 
 **Changes to the guard itself need your confirmation.** A `Write`, `Edit`, `MultiEdit` or
 `NotebookEdit` that adds a new `pii-guard: allow` marker or touches a `pii-guard.json` or anything
 in `~/.config/pii-guard/`, and a shell command that mentions `pii-guard.json`, `~/.config/pii-guard`
-or an allow marker, always get the permission prompt (`ask`), in every mode.
+or an allow marker, get the permission prompt (`ask`) in every mode, as far as the hook recognises
+them: the name `pii-guard.json` is compared without regard to case, but for file tools the user
+config directory (`~/.config/pii-guard/`) is compared with case, so on a case-insensitive file system
+a path spelled in another case is not recognised; a marker assembled from pieces at run time is not
+recognised, `PII_GUARD_DISABLE=1` in the environment switches the hook off,
+and changes to Claude Code's own settings (which can disable the plugin) are not covered.
 
 ## Examples
 
@@ -215,9 +271,9 @@ or an allow marker, always get the permission prompt (`ask`), in every mode.
    and reports `tests/test_import.py, line 12: email address "a***@m***.test"`. Claude replaces the
    value with `user@example.com` and writes again; this time the call goes through.
 2. **A commit that would publish an IBAN.** Claude runs `git add -A && git commit -m "Add invoices"`
-   while `data/invoice.csv` (untracked) contains `PL74 0000 0000 0000 0000 0000 0001`. The commit is
-   denied with
-   `data/invoice.csv (untracked, staged by git add), line 4: IBAN (Polish account number)`.
+   while `data/invoice.csv` (untracked) contains `PL74 0000 0000 0000 0000 0000 0001` on line 4. The
+   commit is denied with
+   `data/invoice.csv (untracked, staged by git add), line 4: IBAN "PL** **** **** **** **** **** **01"`.
 3. **Intended data, your exception.** Your project's public support address must stay in the docs.
    You add it yourself to `pii-guard.json` in the repository:
    `{"allow_values": ["support@example.com"]}` (or `"ignore_paths": ["tests/fixtures/**"]` for a
@@ -232,8 +288,11 @@ them:
 
 1. **User config**: `~/.config/pii-guard/pii-guard.json` (or `pii-guard/pii-guard.json` in the
    directory that `XDG_CONFIG_HOME` names, or the path in `PII_GUARD_CONFIG`).
-2. **Repository config**: `pii-guard.json` in the repository root. It overrides `mode` and
-   `detectors` from the user config and adds to the lists.
+2. **Repository config**: `pii-guard.json` in the repository root. It overrides `mode`,
+   `detectors`, `allow_trailers` and `max_scan_bytes` from the user config and adds to the lists.
+   With the default `"repo_config": "full"`, a repository you clone can therefore switch detectors
+   off, set `warn` or ignore every path without a prompt (only changes that Claude makes ask). For
+   repositories you do not trust, set `"repo_config": "ignore"` in your user config.
 
 Example (`pii-guard.example.json` in this repository):
 
@@ -260,7 +319,7 @@ Example (`pii-guard.example.json` in this repository):
 | `ignore_paths` | `[]` | glob patterns relative to the repository root (`**` matches any depth); a pattern without `/` also matches the file name |
 | `allow_markers` | `pii-guard: allow`, `pii-guard:allow` | a line containing a marker is skipped, e.g. `email = "alice@mail.test"  # pii-guard: allow` |
 | `allow_trailers` | `true` | skip git trailers in commit messages |
-| `phrases_file` | `~/.config/pii-guard/phrases.txt` if it exists | **user config only**; ignored in a repository config |
+| `phrases_file` | `phrases.txt` in the user config directory (see above), if it exists | **user config only**; ignored in a repository config |
 | `repo_config` | `"full"` | **user config only**: `full`, `lists` (repository may add exceptions but not change `mode` or `detectors`) or `ignore` |
 | `max_scan_bytes` | `5000000` | scan limit per file, diff or message; content beyond it is not allowed silently (ask in `block` and `ask` mode, a warning in `warn` mode) |
 
@@ -268,8 +327,11 @@ Environment variables: `PII_GUARD_MODE` (`block`, `warn`, `ask`) overrides the f
 `PII_GUARD_PHRASES` points to a phrases file, `PII_GUARD_CONFIG` to a user config, and
 `PII_GUARD_DISABLE=1` switches the hook off for a session.
 
-**Private phrases file**: one phrase per line, `#` starts a comment, phrases shorter than 3
-characters are ignored. If the file is inside the repository being scanned, pii-guard refuses to use
+**Private phrases file**: UTF-8 text without a byte order mark, one phrase per line, `#` starts a
+comment, phrases shorter than 3 characters are ignored. A file that is not valid UTF-8 makes the hook
+fail with "invalid hook input", and because of `"onFailure": "block"` every matched tool call is then
+blocked until you fix the file (see "If the hook fails"). A byte order mark at the start becomes part
+of the first phrase, which then never matches. If the file is inside the repository being scanned, pii-guard refuses to use
 it and says so, because the list itself is sensitive.
 
 You can also scan files by hand or from CI with the same rules. The exit code is 1 when something
@@ -280,12 +342,19 @@ binary file is printed as "binary file skipped, not scanned" and does not change
 python3 scripts/pii_guard.py scan path/to/file ...
 ```
 
+`scan` takes files, not directories (a directory counts as not scanned, exit code 1), reads them from
+the working tree (so in a git pre-commit hook it checks the working-tree version, not the staged
+one) and does not scan commit messages.
+
 ## Limitations (please read)
 
 - **A heuristic, not a guarantee.** Pattern matching misses data it has no pattern for (names,
   postal addresses, dates of birth, national IDs other than PESEL, phone formats of other countries
   without a `+` prefix) and data that is split, encoded or obfuscated. It will also sometimes flag a
-  number that only looks like personal data. It does not replace human review before you publish.
+  number that only looks like personal data. It does not replace human review before you publish,
+  and it does not make you compliant with any data protection law.
+- **Binary files are not scanned.** A file with a NUL byte in its first 8 KB is skipped with a note,
+  and that covers common carriers of personal data such as `.xlsx`, `.docx`, `.pdf` and images.
 - **A guard against accidents, not against a determined agent or user.** New allow markers and
   configuration changes need your confirmation, but data can still be written through a command the
   hook does not inspect (for example a shell redirection, `cp`, a download tool, a script, or a tool
@@ -330,8 +399,10 @@ python3 scripts/pii_guard.py scan path/to/file ...
   local part and of the domain, and the top-level domain; a PESEL keeps its last two digits; phone,
   IBAN and card numbers keep their first two and last two characters (only the first character
   when they are short), and their length and separators are visible; a private phrase keeps its
-  first character and its length. The output goes to your Claude session, which already has the
-  full value.
+  first character and its length. The output goes to your Claude session, which usually already has
+  the full value; for a commit it can show hints of values from files Claude has not read.
+- **Reading is not checked.** The hook does not look at tools that read data (`Read`, `Grep` and
+  others), so it does not stop the phrases file from being read into the session.
 - The PreToolUse hook runs only for tool calls in Claude Code. Files you edit yourself and commits
   you make outside Claude Code are not checked; for those, call `scan` from a git pre-commit hook or
   CI.
@@ -355,7 +426,8 @@ script that cannot run.
 
 The hook reads JSON from stdin and the files and diffs it needs, matches them with regular
 expressions and prints a decision. It does **not** execute or evaluate anything from the scanned
-content and does **not** use the network. Its only output is the decision for Claude Code, with
+content and opens no network connections itself (in a partial clone, git may download missing
+objects on its own when the hook reads them). Its only output is the decision for Claude Code, with
 findings masked (a private phrase shows only its first character), which becomes part of your
 Claude Code session like any other tool output. The only program it starts is `git`, with a fixed
 argument list, no shell, and external diff drivers, textconv filters and fsmonitor switched off.

@@ -55,16 +55,16 @@ and misconfiguration of your own installation.
 - The hook is declared with `onFailure: "block"`: a crash or timeout blocks the action instead of
   letting it through. Scan time grows with the input size and the number of private phrases, and
   the scan stops after 50 findings. One hook run has a single 8 s deadline shared by the `git`
-  calls, the reads of scanned files and the scanning, designed to keep it below the 15 s hook
-  timeout; reading the configuration and phrases files, and the current file for a `Write` or
-  `Edit`, is not covered by it. Content it could not
+  calls, the reads of working-tree files that a commit takes and the scanning, designed to keep it
+  below the 15 s hook timeout; reading the configuration and phrases files, commit message files
+  (`-F`) and the current file for a `Write` or `Edit` is not covered by it. Content it could not
   scan (over `max_scan_bytes`, unreadable, not a regular file, out of time) leads to a permission
-  prompt (a warning in `warn` mode). Exceptions, where the call is allowed with at most a note: the
-  commit directory is not a git repository or git cannot run (only the command line and existing
-  `-F` message files are scanned), a `-F` message file does not exist when the hook runs, the
-  private phrases file is missing or unreadable (phrase detection is then off), or a configuration
-  file is not valid JSON (it is ignored with a note). A phrases file that is not valid UTF-8 makes
-  the hook fail, which blocks every matched call. Binary files in a commit are not scanned and are listed
+  prompt (a warning in `warn` mode). Exceptions, where the call is allowed with at most a note if
+  nothing else applies: the commit directory is not a git repository or git cannot run (only the
+  command line and existing `-F` message files are scanned), a `-F` message file does not exist
+  when the hook runs, the private phrases file is missing, unreadable or not valid UTF-8 (phrase
+  detection is then off; only the last case adds a note), or a configuration file is not valid JSON
+  (it is ignored with a note). Binary files in a commit are not scanned and are listed
   in a visible note; the `scan` command reports them as skipped. Scanned files and commit message
   files are opened only if they are regular files, so a FIFO or device there cannot stall the hook;
   the configuration and phrases files are opened directly, so keep them regular files.

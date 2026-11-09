@@ -12,7 +12,7 @@ blocks the call (or warns, or asks you, as you prefer) and tells Claude where th
 Other shell commands are not scanned for data: a file written with `>`, a heredoc, `cp` or `sed -i`
 is checked only when a later `git commit` takes it.
 
-> Status: early release (v0.1.5). A single Python file using only the standard library, plus tests.
+> Status: early release (v0.1.6). A single Python file using only the standard library, plus tests.
 > Read "Limitations" before you rely on it.
 
 ## The problem
@@ -164,7 +164,8 @@ get the permission prompt, in `warn` mode a warning:
   not be read;
 - anything left when the time budget runs out (see below).
 
-Exceptions, where the call goes through with at most a note, in every mode:
+Exceptions, where the call goes through with at most a note, in every mode, if nothing else applies
+(a finding, one of the prompts below, content that was not scanned, or a failure of the hook itself):
 
 - the commit directory is not a git repository when the hook runs, or git cannot run: only the
   command line and existing `-F` message files are scanned, and without a finding the call is
@@ -173,8 +174,8 @@ Exceptions, where the call goes through with at most a note, in every mode:
   every file without a scan;
 - a message file (`-F`) that does not exist when the hook runs is skipped;
 - a missing or unreadable private phrases file (also one named in `PII_GUARD_PHRASES`) switches
-  phrase detection off without a message (a file that is not valid UTF-8 is different: see
-  "Private phrases file" below);
+  phrase detection off without a message; a phrases file that is not valid UTF-8 switches it off
+  with a note that names the file;
 - a configuration file that is not valid JSON is ignored with a note: a broken user config means
   the defaults apply (its `repo_config` setting is lost too), and a broken repository config leaves
   the user config in effect.
@@ -211,12 +212,13 @@ scanned for personal data: ..."), and the decision is not changed by it.
 
 Time budget: one hook run has a single 8-second deadline, shared by every `git` call (`rev-parse`,
 the staged diff, the index listings, the untracked file lists, two `cat-file` calls per staged file
-without a text diff, and one per changed tracked file in the working tree), every file read and the
-scan itself. Each `git` call gets only the time that is left and is stopped at the deadline.
-Whatever is not done by then counts as not scanned, as above. This is designed to keep the hook,
-including Python start-up, below its 15-second timeout in `hooks/hooks.json`. Reading the
-configuration and phrases files, and reading the current file for a `Write` or `Edit`, are not
-covered by the deadline.
+without a text diff, and one per changed tracked file in the working tree), the reads of
+working-tree files that the commit takes (untracked files added by `git add`, changed tracked
+files) and the scan itself. Each `git` call gets only the time that is left and is stopped at the
+deadline. Whatever is not done by then counts as not scanned, as above. This is designed to keep
+the hook, including Python start-up, below its 15-second timeout in `hooks/hooks.json`. Reading the
+configuration and phrases files, commit message files (`-F`) and the current file for a `Write` or
+`Edit` is not covered by the deadline.
 
 Content from the tool call itself (`Write`, `Edit`, the command line) is limited by `max_scan_bytes`
 counted in characters. The scan runs in 1 MB pieces cut at line ends, so a value in a single line
@@ -327,12 +329,12 @@ Environment variables: `PII_GUARD_MODE` (`block`, `warn`, `ask`) overrides the f
 `PII_GUARD_PHRASES` points to a phrases file, `PII_GUARD_CONFIG` to a user config, and
 `PII_GUARD_DISABLE=1` switches the hook off for a session.
 
-**Private phrases file**: UTF-8 text without a byte order mark, one phrase per line, `#` starts a
-comment, phrases shorter than 3 characters are ignored. A file that is not valid UTF-8 makes the hook
-fail with "invalid hook input", and because of `"onFailure": "block"` every matched tool call is then
-blocked until you fix the file (see "If the hook fails"). A byte order mark at the start becomes part
-of the first phrase, which then never matches. If the file is inside the repository being scanned, pii-guard refuses to use
-it and says so, because the list itself is sensitive.
+**Private phrases file**: UTF-8 text (a byte order mark at the start is ignored), one phrase per
+line, `#` starts a comment, phrases shorter than 3 characters are ignored. A file that is not valid
+UTF-8 (for example one saved in a Windows code page) is not used: phrase detection is off, every
+checked call carries a note that names the file, and the other detectors keep working. If the file
+is inside the repository being scanned, pii-guard refuses to use it and says so, because the list
+itself is sensitive.
 
 You can also scan files by hand or from CI with the same rules. The exit code is 1 when something
 is found or a file could not be scanned (over `max_scan_bytes`, unreadable, not a regular file); a
@@ -354,7 +356,8 @@ one) and does not scan commit messages.
   number that only looks like personal data. It does not replace human review before you publish,
   and it does not make you compliant with any data protection law.
 - **Binary files are not scanned.** A file with a NUL byte in its first 8 KB is skipped with a note,
-  and that covers common carriers of personal data such as `.xlsx`, `.docx`, `.pdf` and images.
+  and that covers common carriers of personal data such as `.xlsx`, `.docx` and images, and often
+  `.pdf`.
 - **A guard against accidents, not against a determined agent or user.** New allow markers and
   configuration changes need your confirmation, but data can still be written through a command the
   hook does not inspect (for example a shell redirection, `cp`, a download tool, a script, or a tool

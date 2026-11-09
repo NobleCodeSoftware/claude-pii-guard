@@ -167,6 +167,42 @@ class TestFileTools(HookCase):
         self.assertIn("private phrase", reason)
         self.assertNotIn("acme secret project", reason.lower())
 
+    def test_phrases_file_with_byte_order_mark(self):
+        cfg_dir = self.home / ".config" / "pii-guard"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "phrases.txt").write_bytes(b"\xef\xbb\xbfAcme Secret Project\n")
+        code, out, _ = self.run_hook("Write", {"file_path": str(self.repo / "a.md"), "content": "About acme secret project."})
+        self.assertEqual(code, 0)
+        self.assertDecision(out, "deny")
+        self.assertIn("private phrase", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_phrases_file_not_utf8_is_skipped_with_a_note(self):
+        # cp1250 bytes are not valid UTF-8: the file is not used, the call is not blocked, and the
+        # note names the file without showing its content.
+        phrases = self.home / "phrases-cp1250.txt"
+        phrases.write_bytes("Zażółć Projekt\n".encode("cp1250"))
+        env = {"PII_GUARD_PHRASES": str(phrases)}
+        for tool, tool_input in (("Write", {"file_path": str(self.repo / "a.md"), "content": "hello"}),
+                                 ("Bash", {"command": "ls"})):
+            code, out, err = self.run_hook(tool, tool_input, env=env)
+            self.assertEqual(code, 0, err)
+            self.assertIsNotNone(out)
+            self.assertNotIn("hookSpecificOutput", out)
+            note = out["systemMessage"]
+            self.assertIn("phrases-cp1250.txt is not valid UTF-8", note)
+            self.assertIn("phrase detection is off", note)
+            self.assertNotIn("Projekt", note + err)
+
+    def test_phrases_file_not_utf8_keeps_other_detectors(self):
+        phrases = self.home / "phrases-utf16.txt"
+        phrases.write_bytes("Acme Secret Project\n".encode("utf-16"))
+        code, out, _ = self.run_hook("Write", {"file_path": str(self.repo / "a.md"), "content": "mail alice@mail.test"},
+                                     env={"PII_GUARD_PHRASES": str(phrases)})
+        self.assertEqual(code, 0)
+        self.assertDecision(out, "deny")
+        self.assertIn("email address", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIn("not valid UTF-8", out["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_other_tools_and_commands_pass(self):
         self.assertEqual(self.run_hook("Read", {"file_path": "/etc/hostname"})[:2], (0, None))
         self.assertEqual(self.run_hook("Bash", {"command": "echo alice@mail.test"})[:2], (0, None))
@@ -699,6 +735,18 @@ class TestScanCommand(HookCase):
         code, stdout = self.scan(self.repo / "dangling.txt")
         self.assertEqual(code, 1)
         self.assertIn("dangling.txt: not scanned (not a regular file)", stdout)
+
+    def test_phrases_file_not_utf8_is_a_note_not_a_traceback(self):
+        (self.repo / "a.txt").write_text("hello\n")
+        (self.repo / "b.txt").write_text("hello\n")
+        phrases = self.home / "phrases.txt"
+        phrases.write_bytes(b"Acme \xff Project\n")
+        env = dict(self.env, PII_GUARD_PHRASES=str(phrases))
+        res = subprocess.run([sys.executable, str(SCRIPT), "scan", str(self.repo / "a.txt"), str(self.repo / "b.txt")],
+                             capture_output=True, text=True, env=env, cwd=str(self.repo), timeout=30)
+        self.assertEqual(res.returncode, 0)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(res.stderr.count("is not valid UTF-8"), 1)
 
 
 class TestTimeBudget(HookCase):

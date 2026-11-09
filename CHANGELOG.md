@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-11-09
+
+### Fixed
+
+- A private phrases file that is not valid UTF-8 (for example one saved in a Windows code page) no
+  longer makes the hook fail with "invalid hook input", which blocked every matched tool call. The
+  file is not used, phrase detection is off, and a note names the file (never its content); the
+  other detectors keep working. The `scan` command prints the same note once instead of a traceback.
+- A byte order mark at the start of the phrases file is ignored, so the first phrase matches again.
+- Documentation:
+  - The time budget covers the reads of working-tree files that a commit takes; commit message
+    files (`-F`), like the configuration and phrases files and the current file for a `Write` or
+    `Edit`, are read outside it.
+  - The cases where a call goes through with at most a note apply only if nothing else applies
+    (a finding, a prompt, content that was not scanned, or a failure of the hook).
+  - The binary file check often covers `.pdf`, not always.
+  - A code comment on `-F` message files that do not exist yet now says that an earlier part of the
+    same command line may create them, in which case their content is not scanned.
+
 ## [0.1.5] - 2026-11-07
 
 This release makes the documentation describe what the code actually does. Apart from the file name

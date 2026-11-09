@@ -14,16 +14,16 @@ Safety properties (please keep them when you change this file):
 - configuration is parsed with `json`, phrases are plain text lines.
 
 Exit codes: 0 with JSON on stdout (or nothing) is the normal path. 1 means the hook itself failed
-(bad input, including a phrases file that is not valid UTF-8). On its own Claude Code treats exit 1 as a non-blocking error, but hooks/hooks.json
-declares the hook with `"onFailure": "block"`, so the tool call is blocked. The CLI `scan` mode exits 1
-when it finds something or a file could not be scanned, so it can be used from CI or a git pre-commit
-hook.
+(for example on bad input). On its own Claude Code treats exit 1 as a non-blocking error, but
+hooks/hooks.json declares the hook with `"onFailure": "block"`, so the tool call is blocked. The CLI
+`scan` mode exits 1 when it finds something or a file could not be scanned, so it can be used from CI
+or a git pre-commit hook.
 
 Time budget: one hook run has a single deadline (TIME_BUDGET_SECONDS) shared by every git call, read
-of a scanned file and scan step. Each git call may only use the time that is left, which is designed
-to keep the run below the 15-second timeout in hooks/hooks.json; whatever is not done by the deadline
-is reported as not scanned. Reading the configuration and phrases files, and the current file for a
-Write or Edit, is not covered by the deadline.
+of a working-tree file taken into a commit and scan step. Each git call may only use the time that is
+left, which is designed to keep the run below the 15-second timeout in hooks/hooks.json; whatever is
+not done by the deadline is reported as not scanned. Reading the configuration and phrases files,
+commit message files (-F) and the current file for a Write or Edit is not covered by the deadline.
 """
 
 import bisect
@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 # Shared deadline for one hook run, in seconds. Keep it well below the "timeout" in hooks/hooks.json
 # (15 s), which also has to cover starting Python.
@@ -201,15 +201,23 @@ def card_brand(digits):
     return None
 
 
-def load_phrases(path):
+def load_phrases(path, notes=None):
+    """Private phrases from `path`, one per line. A byte order mark at the start is dropped. A file
+    that cannot be read gives no phrases; one that is not valid UTF-8 also adds a note naming the
+    file (never its content)."""
     phrases = []
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if len(line) >= 3 and not line.startswith("#"):
                     phrases.append(line)
     except OSError:
+        return []
+    except UnicodeDecodeError:
+        note = "phrases file %s is not valid UTF-8 and was not used; phrase detection is off" % path
+        if notes is not None and note not in notes:
+            notes.append(note)
         return []
     return phrases
 
@@ -473,7 +481,7 @@ def resolve_phrases(config, repo_root, notes):
     if repo_root and _is_within(path, repo_root):
         notes.append("phrases file is inside the repository and was not used; move it out of the repo")
         return []
-    return load_phrases(path)
+    return load_phrases(path, notes)
 
 
 def _is_within(path, root):
@@ -1866,7 +1874,10 @@ def commit_sources(command, cwd, config, notes, deadline, parsed=None):
     commit_cwd = parsed.commit_cwd if os.path.isdir(parsed.commit_cwd) else (cwd or os.getcwd())
     for f in _message_files(command, commit_cwd):
         if not os.path.lexists(f):
-            continue  # git itself fails on a missing message file, nothing is committed
+            # Missing now: either git fails on it and nothing is committed, or an earlier part of the
+            # same command line creates it (`printf ... > msg && git commit -F msg`), and then its
+            # content is not scanned.
+            continue
         text, info = _read_text(f, limit)
         if text is None:
             sources.append(Source("commit message file %s" % f, "", 1, None,

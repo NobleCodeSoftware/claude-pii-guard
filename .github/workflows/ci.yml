@@ -9,21 +9,32 @@ permissions:
 
 jobs:
   test:
+    name: test (${{ matrix.os }}, ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    # Python 3.8 (the minimum supported version) is no longer available from
+    # setup-python on current Ubuntu runners, so it runs in the official image.
+    container: ${{ matrix.container }}
     timeout-minutes: 5
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.8", "3.12"]
-        exclude:
-          - os: macos-latest
+        include:
+          - os: ubuntu-latest
             python-version: "3.8"
+            container: python:3.8@sha256:d411270700143fa2683cc8264d9fa5d3279fd3b6afff62ae81ea2f9d070e390c
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: ${{ !matrix.container }}
         with:
           python-version: ${{ matrix.python-version }}
       - name: Unit and integration tests
         env:
           PII_GUARD_FORBIDDEN: ${{ secrets.PII_GUARD_FORBIDDEN }}
-        run: python3 -m unittest discover -s tests -v
+        run: |
+          python3 --version
+          python3 -m unittest discover -s tests -v
